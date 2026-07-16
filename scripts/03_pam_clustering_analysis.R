@@ -53,8 +53,8 @@ unlabeled_1bin <- unlabeled_segments %>%
 nrow(unlabeled_1bin)
 
 # check
-unlabeled_1bin %>% count(id) %>% arrange(desc(n)) %>% head()
-unlabeled_1bin %>% count(id, time) %>% filter(n > 1)  # should be empty
+unlabeled_1bin %>% dplyr::count(id) %>% arrange(desc(n)) %>% head()
+unlabeled_1bin %>% dplyr::count(id, time) %>% filter(n > 1)  # should be empty
 
 # 1.2 join COPUS code columns -----
 unlabeled_1bin_codes <- unlabeled_1bin %>%
@@ -175,7 +175,7 @@ clustered_1bin <- X %>%
 
 # check cluster sizes
 cluster_sizes <- clustered_1bin %>%
-  count(cluster, name = "n") %>%
+  dplyr::count(cluster, name = "n") %>%
   mutate(pct = round(100 * n / sum(n), 1)) %>%
   arrange(cluster)
 
