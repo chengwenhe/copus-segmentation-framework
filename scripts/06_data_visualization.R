@@ -8,10 +8,94 @@
 #   - Figure 3b: Number of segments per class by detector
 # ==================================================
 source("scripts/00_setup.R")
-source("scripts/01_primary_secondary_detectors.R")
-source("scripts/02_label_precedence_residual.R")
-source("scripts/04_tertiary_detectors.R")
-source("scripts/05_label_tertiary_coverage.R")
+
+# ==== LOAD FINAL SEGMENTATION CACHE ===========================================
+
+cache_05_path <- "cache/05_final_outputs.rds"
+
+if (!file.exists(cache_05_path)) {
+  stop(
+    "Missing cache file: ",
+    cache_05_path,
+    "\nRun scripts 01, 02, 04, and 05 before running script 06.",
+    call. = FALSE
+  )
+}
+
+cache_05 <- readRDS(cache_05_path)
+
+required_cache_05_objects <- c(
+  "master_data",
+  "interval_labels_final_with_tertiary",
+  "lecture_segments",
+  "clicker_segments",
+  "pi_segments",
+  "tps_segments",
+  "peer_lite_segments",
+  "clicker_lite_segments",
+  "admin_segments",
+  "student_work_segments",
+  "instructorQA_segments",
+  "studentQA_segments",
+  "transition_segments"
+)
+
+missing_cache_05_objects <- setdiff(
+  required_cache_05_objects,
+  names(cache_05)
+)
+
+if (length(missing_cache_05_objects) > 0L) {
+  stop(
+    "Cache 05 is missing required object(s): ",
+    paste(missing_cache_05_objects, collapse = ", "),
+    "\nRe-run scripts/05_label_tertiary_coverage.R.",
+    call. = FALSE
+  )
+}
+
+master_data <- cache_05$master_data
+interval_labels_final_with_tertiary <-
+  cache_05$interval_labels_final_with_tertiary
+
+lecture_segments <- cache_05$lecture_segments
+clicker_segments <- cache_05$clicker_segments
+pi_segments <- cache_05$pi_segments
+tps_segments <- cache_05$tps_segments
+peer_lite_segments <- cache_05$peer_lite_segments
+clicker_lite_segments <- cache_05$clicker_lite_segments
+admin_segments <- cache_05$admin_segments
+student_work_segments <- cache_05$student_work_segments
+
+instructorQA_segments <- cache_05$instructorQA_segments
+studentQA_segments <- cache_05$studentQA_segments
+transition_segments <- cache_05$transition_segments
+
+rm(
+  cache_05,
+  cache_05_path,
+  required_cache_05_objects,
+  missing_cache_05_objects
+)
+
+message(
+  "Loaded final segmentation cache: ",
+  "cache/05_final_outputs.rds"
+)
+
+# Ensure output directories exist before writing figures and tables.
+dir.create(
+  "figures",
+  showWarnings = FALSE,
+  recursive = TRUE
+)
+
+dir.create(
+  "outputs",
+  showWarnings = FALSE,
+  recursive = TRUE
+)
+
 # ==== Figure 2 ====
 # 1. Find the example class with the most distinct profiles --------------------
 # 1.1 Summarize profile diversity + minutes per class ------
@@ -409,7 +493,7 @@ profile_palette <- c(
   "PeerInstruction" = "#E69F00",       # orange
   "Clicker"         = "#C44E52",       # red
   "Lecture"         = "#0072B2",       # blue
-
+  
   "PeerLite"        = "#FDB863",       # light orange
   "ClickerLite"     = "#F4A3A3",       # light red
   "StudentWork"     = "#F0E442",       # yellow

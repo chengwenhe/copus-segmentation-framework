@@ -928,73 +928,279 @@ detect_student_work_segments <- function(df) {
 student_work_segments <- detect_student_work_segments(master_data)
 student_work_segments
 
-# ==== OPTIONAL DETECTOR-LEVEL CHECKS ====
-# easy inspection of ANY detected segment from any detector
-# use one-line wrapper to call inspection
-# preferred COPUS code order (Instructor → Student) 
+# ==== OPTIONAL DETECTOR-LEVEL CHECKS ===========================================
+
+# Print a concise detector summary by default. Detailed heatmap inspections are
+# retained for manual review but are not required for the detector pipeline.
+RUN_DETECTOR_CHECKS <- FALSE
+
+# Preferred COPUS code order for manual inspection
 code_order <- c(
-  "Instructor.Lec","Instructor.CQ","Instructor.PQ","Instructor.FUp",
-  "Instructor.1o1","Instructor.Adm","Instructor.AnQ","Instructor.DV",
-  "Instructor.MG","Instructor.Other","Instructor.RtW","Instructor.W",
-  "Student.L","Student.Ind","Student.CG","Student.OG","Student.WG","Student.AnQ",
-  "Student.Other","Student.Prd","Student.SP","Student.SQ","Student.TQ",
-  "Student.W","Student.WC"
+  "Instructor.Lec", "Instructor.CQ", "Instructor.PQ", "Instructor.FUp",
+  "Instructor.1o1", "Instructor.Adm", "Instructor.AnQ", "Instructor.DV",
+  "Instructor.MG", "Instructor.Other", "Instructor.RtW", "Instructor.W",
+  "Student.L", "Student.Ind", "Student.CG", "Student.OG", "Student.WG",
+  "Student.AnQ", "Student.Other", "Student.Prd", "Student.SP", "Student.SQ",
+  "Student.TQ", "Student.W", "Student.WC"
 )
+
 # Heatmap inspector ------------------------------------------------------------
-inspect_segment_heat <- function(df, id, start_time, end_time,
-                                 plot = FALSE,
-                                 profile = NULL,
-                                 cols = code_order) {
-  
+
+inspect_segment_heat <- function(
+    df,
+    id,
+    start_time,
+    end_time,
+    plot = FALSE,
+    profile = NULL,
+    cols = code_order
+) {
   df_f <- df %>%
-    filter(id == !!id, time >= !!start_time, time <= !!end_time) %>%
-    select(time, any_of(cols))
+    dplyr::filter(
+      .data$id == !!id,
+      .data$time >= !!start_time,
+      .data$time <= !!end_time
+    ) %>%
+    dplyr::select(
+      "time",
+      dplyr::any_of(cols)
+    )
   
   long <- df_f %>%
-    pivot_longer(-time, names_to = "Code", values_to = "Present") %>%
-    mutate(Present = suppressWarnings(as.numeric(Present))) %>%
-    tidyr::replace_na(list(Present = 0)) %>%
-    mutate(Code = factor(Code, levels = cols))
+    tidyr::pivot_longer(
+      cols = -"time",
+      names_to = "Code",
+      values_to = "Present"
+    ) %>%
+    dplyr::mutate(
+      Present = suppressWarnings(as.numeric(.data$Present))
+    ) %>%
+    tidyr::replace_na(
+      list(Present = 0)
+    ) %>%
+    dplyr::mutate(
+      Code = factor(
+        .data$Code,
+        levels = cols
+      )
+    )
   
-  if (plot) {
-    p1 <- ggplot(long, aes(x = time, y = Code, fill = factor(Present))) +
-      geom_tile(color = "grey85") +
-      scale_fill_manual(values = c("0" = "white", "1" = "grey20"), guide = "none") +
-      labs(
-        title = paste0(ifelse(is.null(profile), "", paste0(profile, " — ")),
-                       "Codes over time: ",
-                       id, " (", start_time, "–", end_time, ")"),
+  if (isTRUE(plot)) {
+    p1 <- ggplot2::ggplot(
+      long,
+      ggplot2::aes(
+        x = .data$time,
+        y = .data$Code,
+        fill = factor(.data$Present)
+      )
+    ) +
+      ggplot2::geom_tile(
+        color = "grey85"
+      ) +
+      ggplot2::scale_fill_manual(
+        values = c(
+          "0" = "white",
+          "1" = "grey20"
+        ),
+        guide = "none"
+      ) +
+      ggplot2::labs(
+        title = paste0(
+          ifelse(
+            is.null(profile),
+            "",
+            paste0(profile, " — ")
+          ),
+          "Codes over time: ",
+          id,
+          " (",
+          start_time,
+          "–",
+          end_time,
+          ")"
+        ),
         x = "Time (2-min bins)",
         y = NULL
       ) +
-      theme_classic(base_size = 11)
+      ggplot2::theme_classic(
+        base_size = 11
+      )
+    
     print(p1)
   }
+  
+  invisible(long)
 }
 
-# one-line wrapper to inspect the *first segment* of any detector
-inspect_first <- function(seg_table, profile_name) {
-  if (nrow(seg_table) == 0) {
-    message(profile_name, ": No segments detected.")
+
+# Inspect the first detected segment from one detector --------------------------
+
+inspect_first <- function(
+    seg_table,
+    profile_name
+) {
+  if (nrow(seg_table) == 0L) {
+    message(
+      profile_name,
+      ": No segments detected."
+    )
+    
     return(invisible(NULL))
   }
   
   inspect_segment_heat(
-    df         = master_data,
-    id         = seg_table$id[1],
+    df = master_data,
+    id = seg_table$id[1],
     start_time = seg_table$start_time[1],
-    end_time   = seg_table$end_time[1],
-    profile    = profile_name,
-    plot       = TRUE
+    end_time = seg_table$end_time[1],
+    profile = profile_name,
+    plot = TRUE
   )
 }
 
-# one-line inspect calls (for 7 detectors)
-inspect_first(lecture_segments,       "Lecture")
-inspect_first(clicker_segments,       "Clicker")
-inspect_first(tps_segments,           "TPS")
-inspect_first(pi_segments,            "Peer Instruction")
-inspect_first(peer_lite_segments,     "PeerLite")
-inspect_first(clicker_lite_segments,  "ClickerLite")
-inspect_first(admin_segments,         "Admin")
-inspect_first(student_work_segments,  "Student Work")
+
+# Concise detector summary -----------------------------------------------------
+
+summarize_detector <- function(
+    seg_table,
+    detector_name
+) {
+  tibble::tibble(
+    detector = detector_name,
+    n_segments = nrow(seg_table),
+    median_minutes = if (
+      nrow(seg_table) > 0L &&
+      "minutes" %in% names(seg_table)
+    ) {
+      stats::median(
+        seg_table$minutes,
+        na.rm = TRUE
+      )
+    } else {
+      NA_real_
+    }
+  )
+}
+
+detector_summary <- dplyr::bind_rows(
+  summarize_detector(
+    lecture_segments,
+    "Lecture"
+  ),
+  summarize_detector(
+    clicker_segments,
+    "Clicker"
+  ),
+  summarize_detector(
+    tps_segments,
+    "TPS"
+  ),
+  summarize_detector(
+    pi_segments,
+    "PeerInstruction"
+  ),
+  summarize_detector(
+    peer_lite_segments,
+    "PeerLite"
+  ),
+  summarize_detector(
+    clicker_lite_segments,
+    "ClickerLite"
+  ),
+  summarize_detector(
+    admin_segments,
+    "Admin"
+  ),
+  summarize_detector(
+    student_work_segments,
+    "StudentWork"
+  )
+)
+
+print(detector_summary)
+
+
+# Optional heatmap inspections -------------------------------------------------
+
+if (isTRUE(RUN_DETECTOR_CHECKS)) {
+  inspect_first(
+    lecture_segments,
+    "Lecture"
+  )
+  
+  inspect_first(
+    clicker_segments,
+    "Clicker"
+  )
+  
+  inspect_first(
+    tps_segments,
+    "TPS"
+  )
+  
+  inspect_first(
+    pi_segments,
+    "Peer Instruction"
+  )
+  
+  inspect_first(
+    peer_lite_segments,
+    "PeerLite"
+  )
+  
+  inspect_first(
+    clicker_lite_segments,
+    "ClickerLite"
+  )
+  
+  inspect_first(
+    admin_segments,
+    "Admin"
+  )
+  
+  inspect_first(
+    student_work_segments,
+    "Student Work"
+  )
+} else {
+  message(
+    "Skipping optional detector-level plots. ",
+    "Set RUN_DETECTOR_CHECKS <- TRUE to inspect example segments."
+  )
+}
+
+
+# ==== SAVE CACHE FOR DOWNSTREAM SCRIPTS =======================================
+
+# Save only the objects required by downstream scripts.
+# This avoids saving the entire global environment with save.image().
+dir.create(
+  "cache",
+  showWarnings = FALSE,
+  recursive = TRUE
+)
+
+cache_01 <- list(
+  code_cols = code_cols,
+  master_data = master_data,
+  lecture_segments = lecture_segments,
+  clicker_segments = clicker_segments,
+  pi_segments = pi_segments,
+  tps_segments = tps_segments,
+  peer_lite_segments = peer_lite_segments,
+  clicker_lite_segments = clicker_lite_segments,
+  admin_segments = admin_segments,
+  student_work_segments = student_work_segments
+)
+
+saveRDS(
+  cache_01,
+  "cache/01_primary_secondary_outputs.rds"
+)
+
+message(
+  "Saved primary/secondary detector cache: ",
+  "cache/01_primary_secondary_outputs.rds"
+)
+
+rm(cache_01)

@@ -4,9 +4,163 @@
 # Purpose: Apply precedence rules for tertiary segments and compute coverage
 # ==================================================
 source("scripts/00_setup.R")
-source("scripts/01_primary_secondary_detectors.R")
-source("scripts/02_label_precedence_residual.R")
-source("scripts/04_tertiary_detectors.R")
+
+# ==== LOAD REQUIRED CACHES ====================================================
+
+cache_02_path <- "cache/02_primary_secondary_labels.rds"
+cache_04_path <- "cache/04_tertiary_outputs.rds"
+
+missing_cache_files <- c(
+  cache_02_path,
+  cache_04_path
+)[
+  !file.exists(
+    c(
+      cache_02_path,
+      cache_04_path
+    )
+  )
+]
+
+if (length(missing_cache_files) > 0L) {
+  stop(
+    "Missing required cache file(s): ",
+    paste(missing_cache_files, collapse = ", "),
+    "\nRun scripts 01, 02, and 04 before running script 05.",
+    call. = FALSE
+  )
+}
+
+cache_02 <- readRDS(cache_02_path)
+cache_04 <- readRDS(cache_04_path)
+
+required_cache_02_objects <- c(
+  "master_data",
+  "lecture_segments",
+  "clicker_segments",
+  "pi_segments",
+  "tps_segments",
+  "peer_lite_segments",
+  "clicker_lite_segments",
+  "admin_segments",
+  "student_work_segments",
+  "interval_labels_final"
+)
+
+required_cache_04_objects <- c(
+  "instructorQA_segments",
+  "studentQA_segments",
+  "transition_segments"
+)
+
+missing_cache_02_objects <- setdiff(
+  required_cache_02_objects,
+  names(cache_02)
+)
+
+missing_cache_04_objects <- setdiff(
+  required_cache_04_objects,
+  names(cache_04)
+)
+
+if (length(missing_cache_02_objects) > 0L) {
+  stop(
+    "Cache 02 is missing required object(s): ",
+    paste(missing_cache_02_objects, collapse = ", "),
+    "\nRe-run scripts/01_primary_secondary_detectors.R and ",
+    "scripts/02_label_precedence_residual.R.",
+    call. = FALSE
+  )
+}
+
+if (length(missing_cache_04_objects) > 0L) {
+  stop(
+    "Cache 04 is missing required object(s): ",
+    paste(missing_cache_04_objects, collapse = ", "),
+    "\nRe-run scripts/04_tertiary_detectors.R.",
+    call. = FALSE
+  )
+}
+
+master_data <- cache_02$master_data
+lecture_segments <- cache_02$lecture_segments
+clicker_segments <- cache_02$clicker_segments
+pi_segments <- cache_02$pi_segments
+tps_segments <- cache_02$tps_segments
+peer_lite_segments <- cache_02$peer_lite_segments
+clicker_lite_segments <- cache_02$clicker_lite_segments
+admin_segments <- cache_02$admin_segments
+student_work_segments <- cache_02$student_work_segments
+interval_labels_final <- cache_02$interval_labels_final
+
+instructorQA_segments <- cache_04$instructorQA_segments
+studentQA_segments <- cache_04$studentQA_segments
+transition_segments <- cache_04$transition_segments
+
+rm(
+  cache_02,
+  cache_04,
+  cache_02_path,
+  cache_04_path,
+  missing_cache_files,
+  required_cache_02_objects,
+  required_cache_04_objects,
+  missing_cache_02_objects,
+  missing_cache_04_objects
+)
+
+message(
+  "Loaded primary/secondary label cache: ",
+  "cache/02_primary_secondary_labels.rds"
+)
+
+message(
+  "Loaded tertiary detector cache: ",
+  "cache/04_tertiary_outputs.rds"
+)
+
+
+# ==== HELPER FUNCTION =========================================================
+
+# Expand a segment-level table into one row per interval.
+label_from_segments <- function(
+    segs_tbl,
+    label
+) {
+  if (nrow(segs_tbl) == 0L) {
+    return(
+      tibble::tibble(
+        id = character(),
+        time = integer(),
+        label = character()
+      )
+    )
+  }
+  
+  purrr::pmap_dfr(
+    list(
+      id = segs_tbl$id,
+      start_time = segs_tbl$start_time,
+      end_time = segs_tbl$end_time
+    ),
+    function(
+    id,
+    start_time,
+    end_time
+    ) {
+      tibble::tibble(
+        id = id,
+        time = seq.int(
+          from = start_time,
+          to = end_time
+        ),
+        label = label
+      )
+    }
+  )
+}
+
+
 # ==== MAPPING & LABEL ====
 # 1. Expand tertiary segment tables to interval labels -----
 lab_studentQA    <- label_from_segments(studentQA_segments,    "StudentQA")
@@ -131,3 +285,52 @@ tertiary_distribution <- tertiary_fills %>%
 write_csv(interval_labels_final_with_tertiary, "outputs/interval_labels_final_primary_secondary_tertiary.csv")
 write_csv(coverage_summary_wide_tertiary, "outputs/coverage_summary_wide_tertiary.csv")
 write_csv(tertiary_distribution,"outputs/tertiary_distribution.csv")
+
+
+# ==== SAVE CACHE FOR VISUALIZATION AND DOWNSTREAM USE =========================
+
+# Cache the final interval labels, all detector segment tables, and final
+# coverage summaries required by script 06.
+dir.create(
+  "cache",
+  showWarnings = FALSE,
+  recursive = TRUE
+)
+
+cache_05 <- list(
+  master_data = master_data,
+  interval_labels_final = interval_labels_final,
+  interval_labels_final_with_tertiary =
+    interval_labels_final_with_tertiary,
+  lecture_segments = lecture_segments,
+  clicker_segments = clicker_segments,
+  pi_segments = pi_segments,
+  tps_segments = tps_segments,
+  peer_lite_segments = peer_lite_segments,
+  clicker_lite_segments = clicker_lite_segments,
+  admin_segments = admin_segments,
+  student_work_segments = student_work_segments,
+  instructorQA_segments = instructorQA_segments,
+  studentQA_segments = studentQA_segments,
+  transition_segments = transition_segments,
+  coverage_counts_tertiary = coverage_counts_tertiary,
+  total_intervals_tertiary = total_intervals_tertiary,
+  coverage_summary_tertiary = coverage_summary_tertiary,
+  coverage_summary_wide_tertiary = coverage_summary_wide_tertiary,
+  overall_before = overall_before,
+  overall_after = overall_after,
+  tertiary_fills = tertiary_fills,
+  tertiary_distribution = tertiary_distribution
+)
+
+saveRDS(
+  cache_05,
+  "cache/05_final_outputs.rds"
+)
+
+message(
+  "Saved final segmentation cache: ",
+  "cache/05_final_outputs.rds"
+)
+
+rm(cache_05)

@@ -4,8 +4,58 @@
 # Purpose: Run tertiary detectors
 # ==================================================
 source("scripts/00_setup.R")
-source("scripts/01_primary_secondary_detectors.R")
-source("scripts/02_label_precedence_residual.R")
+
+# ==== LOAD PRIMARY/SECONDARY LABEL CACHE ======================================
+
+cache_02_path <- "cache/02_primary_secondary_labels.rds"
+
+if (!file.exists(cache_02_path)) {
+  stop(
+    "Missing cache file: ",
+    cache_02_path,
+    "\nRun scripts/01_primary_secondary_detectors.R and ",
+    "scripts/02_label_precedence_residual.R first.",
+    call. = FALSE
+  )
+}
+
+cache_02 <- readRDS(cache_02_path)
+
+required_cache_02_objects <- c(
+  "master_data",
+  "unlabeled_segments"
+)
+
+missing_cache_02_objects <- setdiff(
+  required_cache_02_objects,
+  names(cache_02)
+)
+
+if (length(missing_cache_02_objects) > 0L) {
+  stop(
+    "Cache 02 is missing required object(s): ",
+    paste(missing_cache_02_objects, collapse = ", "),
+    "\nRe-run scripts/01_primary_secondary_detectors.R and ",
+    "scripts/02_label_precedence_residual.R.",
+    call. = FALSE
+  )
+}
+
+master_data <- cache_02$master_data
+unlabeled_segments <- cache_02$unlabeled_segments
+
+rm(
+  cache_02,
+  cache_02_path,
+  required_cache_02_objects,
+  missing_cache_02_objects
+)
+
+message(
+  "Loaded primary/secondary label cache: ",
+  "cache/02_primary_secondary_labels.rds"
+)
+
 # ==== TERTIARY DETECTORS ====
 # Instructor QA ----------------
 # 1) build flags on residual block
@@ -344,34 +394,154 @@ transition_segments <- detect_transition_from_unlabeled(
 
 transition_segments
 
+# ==== OPTIONAL DETECTOR-LEVEL CHECKS ===========================================
 
+# These checks are useful for manually inspecting example segments, but they
+# are not required for the detector pipeline or downstream scripts.
+RUN_DETECTOR_CHECKS <- FALSE
 
-# ==== OPTIONAL DETECTOR-LEVEL CHECKS ====
-# define helper to inspect -----
-inspect_segment <- function(df, id, start_time, end_time,
-                            cols = c("Instructor.Lec","Instructor.CQ","Instructor.PQ","Instructor.FUp",
-                                     "Student.L","Student.Ind","Student.CG","Student.OG","Student.WG","Student.AnQ")) {
-  df %>% 
-    filter(id == !!id, time >= !!start_time, time <= !!end_time) %>%
-    select(id, time, any_of(cols))
+inspect_segment <- function(
+    df,
+    id,
+    start_time,
+    end_time,
+    cols = c(
+      "Instructor.Lec",
+      "Instructor.CQ",
+      "Instructor.PQ",
+      "Instructor.FUp",
+      "Student.L",
+      "Student.Ind",
+      "Student.CG",
+      "Student.OG",
+      "Student.WG",
+      "Student.AnQ"
+    )
+) {
+  df %>%
+    dplyr::filter(
+      .data$id == !!id,
+      .data$time >= !!start_time,
+      .data$time <= !!end_time
+    ) %>%
+    dplyr::select(
+      "id",
+      "time",
+      dplyr::any_of(cols)
+    )
 }
 
-# Instructor QA inspection ------
-s <- instructorQA_segments[1,]
-inspect_segment(master_data, s$id, s$start_time, s$end_time,
-                cols = c("Instructor.PQ","Instructor.FUp","Instructor.RtW",
-                         "Student.L","Student.AnQ"))
+if (isTRUE(RUN_DETECTOR_CHECKS)) {
+  if (nrow(instructorQA_segments) > 0L) {
+    s <- instructorQA_segments[1, ]
+    
+    print(
+      inspect_segment(
+        master_data,
+        s$id,
+        s$start_time,
+        s$end_time,
+        cols = c(
+          "Instructor.PQ",
+          "Instructor.FUp",
+          "Instructor.RtW",
+          "Student.L",
+          "Student.AnQ"
+        )
+      )
+    )
+  } else {
+    message("No InstructorQA segments available for manual inspection.")
+  }
+  
+  if (nrow(studentQA_segments) > 0L) {
+    s <- studentQA_segments[1, ]
+    
+    print(
+      inspect_segment(
+        master_data,
+        s$id,
+        s$start_time,
+        s$end_time,
+        cols = c(
+          "Instructor.AnQ",
+          "Instructor.FUp",
+          "Instructor.RtW",
+          "Student.SQ",
+          "Student.L"
+        )
+      )
+    )
+  } else {
+    message("No StudentQA segments available for manual inspection.")
+  }
+  
+  if (nrow(transition_segments) > 0L) {
+    s <- transition_segments[1, ]
+    
+    print(
+      inspect_segment(
+        master_data,
+        s$id,
+        s$start_time,
+        s$end_time,
+        cols = c(
+          "Instructor.Other",
+          "Instructor.W",
+          "Student.Other",
+          "Student.W",
+          "Instructor.Lec",
+          "Instructor.PQ",
+          "Instructor.CQ",
+          "Instructor.FUp",
+          "Instructor.AnQ",
+          "Student.Ind",
+          "Student.CG",
+          "Student.OG",
+          "Student.WG",
+          "Student.SQ",
+          "Student.AnQ"
+        )
+      )
+    )
+  } else {
+    message("No Transition segments available for manual inspection.")
+  }
+  
+  if (exists("s")) {
+    rm(s)
+  }
+} else {
+  message(
+    "Skipping optional detector-level checks. ",
+    "Set RUN_DETECTOR_CHECKS <- TRUE to inspect example segments."
+  )
+}
 
-# Student QA inspection ------
-s <- studentQA_segments[1,]
-inspect_segment(master_data, s$id, s$start_time, s$end_time,
-                cols = c("Instructor.AnQ","Instructor.FUp","Instructor.RtW",
-                         "Student.SQ","Student.L"))
 
-# Transition inspection ------
-s <- transition_segments[1,]
-inspect_segment(master_data, s$id, s$start_time, s$end_time,
-                cols = c("Instructor.Other","Instructor.W",
-                         "Student.Other","Student.W",
-                         "Instructor.Lec","Instructor.PQ","Instructor.CQ","Instructor.FUp","Instructor.AnQ",
-                         "Student.Ind","Student.CG","Student.OG","Student.WG","Student.SQ","Student.AnQ"))
+# ==== SAVE CACHE FOR DOWNSTREAM SCRIPTS =======================================
+
+# Save only the tertiary segment tables required by scripts 05 and 06.
+dir.create(
+  "cache",
+  showWarnings = FALSE,
+  recursive = TRUE
+)
+
+cache_04 <- list(
+  instructorQA_segments = instructorQA_segments,
+  studentQA_segments = studentQA_segments,
+  transition_segments = transition_segments
+)
+
+saveRDS(
+  cache_04,
+  "cache/04_tertiary_outputs.rds"
+)
+
+message(
+  "Saved tertiary detector cache: ",
+  "cache/04_tertiary_outputs.rds"
+)
+
+rm(cache_04)

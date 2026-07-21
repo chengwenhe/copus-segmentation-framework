@@ -4,8 +4,60 @@
 # Purpose: Perform PAM clustering on residual intervals
 # ==================================================
 source("scripts/00_setup.R")
-source("scripts/01_primary_secondary_detectors.R")
-source("scripts/02_label_precedence_residual.R")
+
+# ==== LOAD PRIMARY/SECONDARY LABEL CACHE ======================================
+
+cache_02_path <- "cache/02_primary_secondary_labels.rds"
+
+if (!file.exists(cache_02_path)) {
+  stop(
+    "Missing cache file: ",
+    cache_02_path,
+    "\nRun scripts/01_primary_secondary_detectors.R and ",
+    "scripts/02_label_precedence_residual.R first.",
+    call. = FALSE
+  )
+}
+
+cache_02 <- readRDS(cache_02_path)
+
+required_cache_02_objects <- c(
+  "code_cols",
+  "master_data",
+  "unlabeled_segments"
+)
+
+missing_cache_02_objects <- setdiff(
+  required_cache_02_objects,
+  names(cache_02)
+)
+
+if (length(missing_cache_02_objects) > 0L) {
+  stop(
+    "Cache 02 is missing required object(s): ",
+    paste(missing_cache_02_objects, collapse = ", "),
+    "\nRe-run scripts/01_primary_secondary_detectors.R and ",
+    "scripts/02_label_precedence_residual.R.",
+    call. = FALSE
+  )
+}
+
+code_cols <- cache_02$code_cols
+master_data <- cache_02$master_data
+unlabeled_segments <- cache_02$unlabeled_segments
+
+rm(
+  cache_02,
+  cache_02_path,
+  required_cache_02_objects,
+  missing_cache_02_objects
+)
+
+message(
+  "Loaded primary/secondary label cache: ",
+  "cache/02_primary_secondary_labels.rds"
+)
+
 # Phase 1 Diagnostic profiling---------------------------------
 # 1. extract 1-interval (2-minute) unlabeled chunks
 unlabeled_1bin <- unlabeled_segments %>%
@@ -28,7 +80,7 @@ dim(unlabeled_1bin_data)
 
 # 3. code frequency profile
 code_freq_1bin <- unlabeled_1bin_data %>%
-  summarise(across(everything(), sum, na.rm = TRUE)) %>%
+  summarise(across(everything(), ~ sum(.x, na.rm = TRUE))) %>%
   pivot_longer(
     cols = everything(),
     names_to = "code",
@@ -139,25 +191,93 @@ ggplot(sil_tbl, aes(x = k, y = silhouette)) +
   ) +
   theme_minimal(base_size = 13)
 
-# 3.2 optional supplementary NbClust check -----
-# NbClust to determine number of clusters (multiple indices)
-set.seed(123) # for reproducible use and freezes randomness
+# 3.2 optional supplementary NbClust check -------------------------------------
+# This diagnostic is retained for manuscript reproducibility, but it is not
+# required for the final PAM solution. The final number of clusters is selected
+# primarily using silhouette width.
+#
+# Set RUN_NBCLUST to TRUE only when you explicitly want to rerun this
+# supplementary diagnostic. NbClust may take several minutes.
 
-# NbClust operates on a feature matrix (not a distance matrix)
-# NbClust primarily supports hierarchical or k-means–based methods
-# Use it as an independent diagnostic for plausible K values
+RUN_NBCLUST <- FALSE
 
-nb_res <- NbClust(
-  data = X_mat,
-  distance = "binary",     # binary distance for 0/1 COPUS codes
-  min.nc = 2,
-  max.nc = 12,
-  method = "ward.D2",      # commonly and widely used in NbClust
-  index = "all"            # evaluate all available indices
-)
+nb_res <- NULL
+nbclust_recommendations <- tibble::tibble()
+nbclust_vote_summary <- tibble::tibble()
 
-# summary of how many indices recommend each K
-nb_res$Best.nc
+if (isTRUE(RUN_NBCLUST)) {
+  set.seed(123)
+  
+  # NbClust operates on a feature matrix rather than the Gower distance matrix.
+  # Its internal diagnostic plots are redirected to a temporary PDF device and
+  # deleted after the analysis, so no graph is shown or saved.
+  nbclust_temp_plot <- tempfile(
+    pattern = "nbclust_",
+    fileext = ".pdf"
+  )
+  
+  grDevices::pdf(
+    nbclust_temp_plot,
+    width = 12,
+    height = 10
+  )
+  
+  nb_res <- tryCatch(
+    NbClust(
+      data = X_mat,
+      distance = "binary",
+      min.nc = 2,
+      max.nc = 12,
+      method = "ward.D2",
+      index = "all"
+    ),
+    finally = {
+      grDevices::dev.off()
+      unlink(nbclust_temp_plot)
+    }
+  )
+  
+  # Convert the recommendations from individual indices into readable tables.
+  nbclust_recommendations <- tibble::tibble(
+    index = colnames(nb_res$Best.nc),
+    recommended_k = as.integer(nb_res$Best.nc[1, ]),
+    criterion_value = as.numeric(nb_res$Best.nc[2, ])
+  )
+  
+  nbclust_vote_summary <- nbclust_recommendations %>%
+    dplyr::count(
+      .data$recommended_k,
+      name = "n_indices"
+    ) %>%
+    dplyr::arrange(
+      dplyr::desc(.data$n_indices),
+      .data$recommended_k
+    )
+  
+  print(nbclust_vote_summary)
+  
+  write_csv(
+    nbclust_recommendations,
+    "outputs/nbclust_recommendations.csv"
+  )
+  
+  write_csv(
+    nbclust_vote_summary,
+    "outputs/nbclust_vote_summary.csv"
+  )
+  
+  message(
+    "Completed optional NbClust diagnostic. ",
+    "Recommendations varied across indices; silhouette width remains ",
+    "the primary criterion for selecting the final PAM solution."
+  )
+} else {
+  message(
+    "Skipping optional NbClust diagnostic. ",
+    "Set RUN_NBCLUST <- TRUE in Section 3.2 to run it."
+  )
+}
+
 
 # 4. Fit final PAM model -------------------------------------------------------
 # 4.1 fit PAM clustering for final k = 5 ------
