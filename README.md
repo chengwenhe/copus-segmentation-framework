@@ -163,7 +163,7 @@ To segment an observation selected by number:
 demo <- run_demo_observation(325)
 ```
 
-This prints the final consecutive instructional segments, plots the segmentation timeline, and stores the complete output in `demo`.
+This prints the final consecutive instructional segments and the detected segment timeline graph, and stores the complete output in `demo`.
 
 Useful outputs include:
 
