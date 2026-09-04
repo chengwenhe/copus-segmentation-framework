@@ -14,6 +14,14 @@ The repository supports three workflows:
 2. Regenerating downstream analyses and figures from cached intermediate objects
 3. Applying the completed framework to one classroom observation through a standalone function or live demo
 
+## Note on use
+
+This framework is still under active development and validation. We welcome feedback, and we encourage you to contact us if you plan to use the framework for research or instructional improvement.
+
+**Contact:**
+- Cheng-Wen He: cheng-wen-he@uiowa.edu
+- Jordan Harshman: jordan-harshman@uiowa.edu
+
 ## Repository structure
 
 ```text
