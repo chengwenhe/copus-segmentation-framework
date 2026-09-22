@@ -22,6 +22,17 @@ This framework is still under active development and validation. We welcome feed
 - Cheng-Wen He: cheng-wen-he@uiowa.edu
 - Jordan Harshman: jordan-harshman@uiowa.edu
 
+## September 2026 update
+
+Following small-scale video validation, the detector definitions and scanning logic were systematically reviewed and refined. Key updates include:
+
+- refined boundary matching and scanner progression for Peer Instruction, Clicker, Think–Pair–Share, Peer-Lite, and Clicker-Lite;
+- revised the Admin and Student Work detectors to use chronologically consecutive intervals and broadened the Student Work detection rule;
+- tightened the anchor rules for Instructor QA and Student QA and allowed instructional codes to co-occur within Transition segments; and
+- synchronized the standalone segmentation function with the refined pipeline and added optional, priority-ranked alternative-segment lanes to the live demo.
+
+Existing function calls remain supported. Because several detector rules were refined, segmentation results generated with this version may differ from results generated with earlier versions.
+
 ## Repository structure
 
 ```text
