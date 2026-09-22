@@ -14,16 +14,17 @@
 #   3. Ask a visitor to choose a number from 1 to n_demo_observations.
 #   4. Run:
 #        demo <- run_demo_observation(325)
+#      To add ranked alternative-label bars:
+#        demo <- run_demo_observation(325, show_alternatives = TRUE)
 #
 # Main outputs:
 #   demo$segments        # final consecutive segments
 #   demo$display_table   # final + alternative labels
 #   demo$raw_copus       # original COPUS observation
 #   demo$labeled_copus   # COPUS intervals joined with final labels
-#   demo$plot            # COPUS matrix + detected segment timeline
+#   demo$plot            # COPUS matrix + final/optional alternative timelines
 #   demo$result          # complete detect_segments() result object
 # ================================================================
-
 
 # ---- File locations ----------------------------------------------------------
 
@@ -59,19 +60,19 @@ suppressPackageStartupMessages({
 
 # ---- Load the segmentation function -----------------------------------------
 
-if (!exists("detect_segments", mode = "function")) {
-  if (!file.exists(COPUS_DEMO_FUNCTION_PATH)) {
-    stop(
-      "Could not find the segmentation function script at:\n  ",
-      COPUS_DEMO_FUNCTION_PATH,
-      "\nOpen the repository as the working directory or update ",
-      "`COPUS_DEMO_FUNCTION_PATH`.",
-      call. = FALSE
-    )
-  }
-  
-  source(COPUS_DEMO_FUNCTION_PATH)
+# REVISED: Always source the current detector file. This prevents a stale
+# detect_segments() already present in the R environment from powering the demo.
+if (!file.exists(COPUS_DEMO_FUNCTION_PATH)) {
+  stop(
+    "Could not find the segmentation function script at:\n  ",
+    COPUS_DEMO_FUNCTION_PATH,
+    "\nOpen the repository as the working directory or update ",
+    "`COPUS_DEMO_FUNCTION_PATH`.",
+    call. = FALSE
+  )
 }
+
+source(COPUS_DEMO_FUNCTION_PATH)
 
 
 # ---- Initialize demo data ----------------------------------------------------
@@ -93,19 +94,22 @@ initialize_copus_demo <- function(
     data_path,
     show_col_types = FALSE,
     progress = FALSE
-  ) %>%
-    dplyr::mutate(
-      id = as.character(.data$id),
-      time = as.integer(.data$time)
-    ) %>%
-    dplyr::arrange(.data$id, .data$time)
+  )
   
+  # REVISED: Validate these columns before referring to them in mutate().
   if (!all(c("id", "time") %in% names(data))) {
     stop(
       "The demo dataset must contain `id` and `time` columns.",
       call. = FALSE
     )
   }
+  
+  data <- data %>%
+    dplyr::mutate(
+      id = as.character(.data$id),
+      time = as.integer(.data$time)
+    ) %>%
+    dplyr::arrange(.data$id, .data$time)
   
   if (nrow(data) == 0L) {
     stop("The demo dataset contains no rows.", call. = FALSE)
@@ -241,14 +245,21 @@ COPUS_DEMO_CODE_LABELS <- c(
 
 plot_demo_observation <- function(
     demo,
-    gap_width = 0.8
+    gap_width = 0.8,
+    show_alternatives = isTRUE(demo$show_alternatives),
+    max_alternative_lanes = 3L
 ) {
   required_fields <- c(
     "session_number",
     "id",
-    "labeled_copus",
-    "segments"
+    "labeled_copus"
   )
+  
+  # REVISED: `segments` was previously required but unused. Alternatives are
+  # required only when their plot lanes are requested.
+  if (isTRUE(show_alternatives)) {
+    required_fields <- c(required_fields, "alternatives")
+  }
   
   missing_fields <- setdiff(required_fields, names(demo))
   
@@ -258,6 +269,26 @@ plot_demo_observation <- function(
       paste(missing_fields, collapse = ", "),
       call. = FALSE
     )
+  }
+  
+  if (
+    length(max_alternative_lanes) != 1L ||
+    !is.numeric(max_alternative_lanes) ||
+    is.na(max_alternative_lanes) ||
+    max_alternative_lanes < 1 ||
+    (!is.infinite(max_alternative_lanes) &&
+     max_alternative_lanes %% 1 != 0)
+  ) {
+    stop(
+      "`max_alternative_lanes` must be a positive whole number or `Inf`.",
+      call. = FALSE
+    )
+  }
+  
+  alternative_lane_limit <- if (is.infinite(max_alternative_lanes)) {
+    Inf
+  } else {
+    as.integer(max_alternative_lanes)
   }
   
   missing_codes <- setdiff(
@@ -326,6 +357,143 @@ plot_demo_observation <- function(
       x_plot = .data$start_x + .data$within_segment_index
     )
   
+  # REVISED: Map alternative Start/End times onto the same x_plot coordinates
+  # used by final segments and the COPUS matrix. This preserves exact alignment
+  # even though visual gaps are inserted between final segments.
+  alternative_df <- tibble::tibble()
+  n_available_alternative_lanes <- 0L
+  alternatives_truncated <- FALSE
+  
+  if (isTRUE(show_alternatives) && nrow(demo$alternatives) > 0L) {
+    required_alternative_columns <- c(
+      "Segment_ID",
+      "Start",
+      "End",
+      "Alternative_Label",
+      "Alternative_Rank"
+    )
+    
+    missing_alternative_columns <- setdiff(
+      required_alternative_columns,
+      names(demo$alternatives)
+    )
+    
+    if (length(missing_alternative_columns) > 0L) {
+      stop(
+        "`demo$alternatives` is missing plotting column(s): ",
+        paste(missing_alternative_columns, collapse = ", "),
+        call. = FALSE
+      )
+    }
+    
+    alternative_source <- demo$alternatives %>%
+      dplyr::transmute(
+        Segment_ID = as.integer(.data$Segment_ID),
+        Start = as.integer(.data$Start),
+        End = as.integer(.data$End),
+        Alternative_Label = trimws(.data$Alternative_Label),
+        Alternative_Rank = as.integer(.data$Alternative_Rank)
+      )
+    
+    if (
+      anyNA(alternative_source$Segment_ID) ||
+      anyNA(alternative_source$Start) ||
+      anyNA(alternative_source$End) ||
+      anyNA(alternative_source$Alternative_Rank) ||
+      any(alternative_source$Start > alternative_source$End) ||
+      any(alternative_source$Alternative_Rank < 1L)
+    ) {
+      stop(
+        "`demo$alternatives` contains invalid segment coordinates or ranks.",
+        call. = FALSE
+      )
+    }
+    
+    unknown_alternative_labels <- setdiff(
+      unique(alternative_source$Alternative_Label),
+      names(COPUS_DEMO_PROFILE_PALETTE)
+    )
+    
+    if (length(unknown_alternative_labels) > 0L) {
+      stop(
+        "No plot color was defined for alternative label(s): ",
+        paste(unknown_alternative_labels, collapse = ", "),
+        call. = FALSE
+      )
+    }
+    
+    n_available_alternative_lanes <- max(
+      alternative_source$Alternative_Rank
+    )
+    
+    alternatives_truncated <-
+      is.finite(alternative_lane_limit) &&
+      n_available_alternative_lanes > alternative_lane_limit
+    
+    x_lookup <- timeline_df %>%
+      dplyr::transmute(
+        Segment_ID = as.integer(.data$run_id),
+        time = as.integer(.data$time),
+        x_plot = .data$x_plot
+      )
+    
+    alternative_df <- alternative_source %>%
+      dplyr::filter(
+        .data$Alternative_Rank <= alternative_lane_limit
+      ) %>%
+      dplyr::left_join(
+        x_lookup %>%
+          dplyr::rename(
+            Start = time,
+            alternative_start_x = x_plot
+          ),
+        by = c("Segment_ID", "Start")
+      ) %>%
+      dplyr::left_join(
+        x_lookup %>%
+          dplyr::rename(
+            End = time,
+            alternative_end_x = x_plot
+          ),
+        by = c("Segment_ID", "End")
+      )
+    
+    if (
+      anyNA(alternative_df$alternative_start_x) ||
+      anyNA(alternative_df$alternative_end_x)
+    ) {
+      stop(
+        "An alternative segment could not be aligned to the final timeline.",
+        call. = FALSE
+      )
+    }
+    
+    alternative_df <- alternative_df %>%
+      dplyr::mutate(
+        xmin = .data$alternative_start_x - 0.5,
+        xmax = .data$alternative_end_x + 0.5,
+        profile = factor(
+          .data$Alternative_Label,
+          levels = names(COPUS_DEMO_PROFILE_PALETTE)
+        )
+      )
+  }
+  
+  if (nrow(alternative_df) == 0L) {
+    alternative_df <- tibble::tibble(
+      Alternative_Rank = integer(),
+      xmin = double(),
+      xmax = double(),
+      lane_ymin = double(),
+      lane_ymax = double(),
+      lane_ymid = double(),
+      profile = factor(
+        character(),
+        levels = names(COPUS_DEMO_PROFILE_PALETTE)
+      )
+    )
+  }
+  
   raw_code_long <- timeline_df %>%
     dplyr::select(
       "id",
@@ -387,11 +555,43 @@ plot_demo_observation <- function(
   
   matrix_top_y <- max(code_y_df$y_pos, na.rm = TRUE)
   
-  timeline_bar_ymin <- matrix_top_y + 4.0
-  timeline_bar_ymax <- matrix_top_y + 5.0
-  interval_num_y <- matrix_top_y + 6.0
-  segment_label_y <- matrix_top_y + 2.9
-  class_label_y <- matrix_top_y + 7.2
+  n_alternative_lanes <- if (nrow(alternative_df) == 0L) {
+    0L
+  } else {
+    max(alternative_df$Alternative_Rank)
+  }
+  
+  # REVISED: Alternative_Rank represents a distinct candidate label within
+  # each final segment. Disconnected runs of the same label share one lane,
+  # while lane ranking restarts within every final Segment_ID.
+  if (n_alternative_lanes > 0L) {
+    alternative_lane_height <- 0.68
+    alternative_lane_step <- 0.88
+    alternative_lane_base <- matrix_top_y + 1.2
+    
+    alternative_df <- alternative_df %>%
+      dplyr::mutate(
+        lane_ymin = alternative_lane_base +
+          (n_alternative_lanes - .data$Alternative_Rank) *
+          alternative_lane_step,
+        lane_ymax = .data$lane_ymin + alternative_lane_height,
+        lane_ymid = (.data$lane_ymin + .data$lane_ymax) / 2
+      )
+    
+    alternative_top_y <- max(alternative_df$lane_ymax)
+    segment_label_y <- alternative_top_y + 0.65
+    timeline_bar_ymin <- segment_label_y + 0.65
+    timeline_bar_ymax <- timeline_bar_ymin + 1.0
+    interval_num_y <- timeline_bar_ymax + 1.0
+    class_label_y <- interval_num_y + 1.2
+  } else {
+    # Preserve the original final-only layout when no alternatives are shown.
+    timeline_bar_ymin <- matrix_top_y + 4.0
+    timeline_bar_ymax <- matrix_top_y + 5.0
+    interval_num_y <- matrix_top_y + 6.0
+    segment_label_y <- matrix_top_y + 2.9
+    class_label_y <- matrix_top_y + 7.2
+  }
   
   x_min <- min(timeline_df$x_plot, na.rm = TRUE) - 0.5
   x_max <- max(timeline_df$x_plot, na.rm = TRUE) + 0.5
@@ -399,15 +599,52 @@ plot_demo_observation <- function(
   left_label_x <- x_min - 3.8
   code_label_x <- x_min - 1.1
   
-  present_profiles <- segment_df %>%
-    dplyr::pull(.data$profile) %>%
-    as.character() %>%
-    unique()
+  timeline_row_labels <- tibble::tibble(
+    row_label = "Final",
+    y = (timeline_bar_ymin + timeline_bar_ymax) / 2
+  )
+  
+  if (n_alternative_lanes > 0L) {
+    alternative_row_labels <- alternative_df %>%
+      dplyr::distinct(.data$Alternative_Rank, .data$lane_ymid) %>%
+      dplyr::arrange(.data$Alternative_Rank) %>%
+      dplyr::transmute(
+        row_label = paste0("Alt ", .data$Alternative_Rank),
+        y = .data$lane_ymid
+      )
+    
+    timeline_row_labels <- dplyr::bind_rows(
+      timeline_row_labels,
+      alternative_row_labels
+    )
+  }
+  
+  # REVISED: Include profiles appearing only as alternatives in the legend.
+  present_profiles <- unique(c(
+    as.character(segment_df$profile),
+    as.character(alternative_df$profile)
+  ))
   
   present_profiles <- intersect(
     names(COPUS_DEMO_PROFILE_PALETTE),
     present_profiles
   )
+  
+  plot_subtitle <- if (n_alternative_lanes > 0L) {
+    "Raw COPUS behaviors, final segments, and priority-masked alternatives"
+  } else {
+    "Raw COPUS behaviors and detected instructional segments"
+  }
+  
+  plot_caption <- if (isTRUE(alternatives_truncated)) {
+    paste0(
+      "Alternative bars show the top ",
+      alternative_lane_limit,
+      " ranks; complete alternatives remain in demo$display_table."
+    )
+  } else {
+    NULL
+  }
   
   ggplot2::ggplot() +
     ggplot2::geom_tile(
@@ -432,6 +669,17 @@ plot_demo_observation <- function(
       hjust = 1,
       size = 3.5
     ) +
+    ggplot2::geom_text(
+      data = timeline_row_labels,
+      ggplot2::aes(
+        x = code_label_x,
+        y = .data$y,
+        label = .data$row_label
+      ),
+      hjust = 1,
+      size = 3.5,
+      fontface = "bold"
+    ) +
     ggplot2::geom_rect(
       data = segment_df,
       ggplot2::aes(
@@ -441,8 +689,22 @@ plot_demo_observation <- function(
         ymax = timeline_bar_ymax,
         fill = .data$profile
       ),
-      color = "white",
-      linewidth = 0.25
+      # REVISED: A dark, heavier border distinguishes final from alternatives.
+      color = "#1A1A1A",
+      linewidth = 0.7
+    ) +
+    ggplot2::geom_rect(
+      data = alternative_df,
+      ggplot2::aes(
+        xmin = .data$xmin,
+        xmax = .data$xmax,
+        ymin = .data$lane_ymin,
+        ymax = .data$lane_ymax,
+        fill = .data$profile
+      ),
+      color = "#666666",
+      linewidth = 0.25,
+      alpha = 1
     ) +
     ggplot2::geom_text(
       data = timeline_df,
@@ -506,6 +768,16 @@ plot_demo_observation <- function(
       drop = TRUE,
       name = "Detector"
     ) +
+    # REVISED: Keep plot-bar borders, but show clean borderless legend swatches.
+    ggplot2::guides(
+      fill = ggplot2::guide_legend(
+        override.aes = list(
+          color = NA,
+          linewidth = 0,
+          alpha = 1
+        )
+      )
+    ) +
     ggplot2::scale_y_continuous(
       breaks = NULL,
       limits = c(0, class_label_y + 1),
@@ -525,7 +797,8 @@ plot_demo_observation <- function(
         demo$id,
         ")"
       ),
-      subtitle = "Raw COPUS behaviors and detected instructional segments",
+      subtitle = plot_subtitle,
+      caption = plot_caption,
       x = NULL,
       y = NULL
     ) +
@@ -540,6 +813,10 @@ plot_demo_observation <- function(
       legend.title = ggplot2::element_text(face = "bold"),
       legend.key.size = grid::unit(0.8, "cm"),
       plot.title = ggplot2::element_text(face = "bold"),
+      plot.caption = ggplot2::element_text(
+        hjust = 0,
+        color = "#555555"
+      ),
       plot.margin = ggplot2::margin(10, 10, 10, 40)
     )
 }
@@ -553,7 +830,8 @@ run_demo_observation <- function(
     show_plot = TRUE,
     print_results = TRUE,
     data = demo_data,
-    session_index = demo_session_index
+    session_index = demo_session_index,
+    max_alternative_lanes = 3L
 ) {
   number <- validate_demo_number(
     number = number,
@@ -613,7 +891,8 @@ run_demo_observation <- function(
     alternatives = segmentation_result$alternatives,
     result = segmentation_result,
     show_alternatives = isTRUE(show_alternatives),
-    show_plot = isTRUE(show_plot)
+    show_plot = isTRUE(show_plot),
+    max_alternative_lanes = max_alternative_lanes
   )
   
   class(demo_result) <- c(
@@ -623,7 +902,13 @@ run_demo_observation <- function(
   
   plot_start <- proc.time()[["elapsed"]]
   
-  demo_result$plot <- plot_demo_observation(demo_result)
+  # NOTE: The plot is deliberately constructed even when show_plot = FALSE so
+  # callers can still inspect or save demo_result$plot after a silent run.
+  demo_result$plot <- plot_demo_observation(
+    demo = demo_result,
+    show_alternatives = demo_result$show_alternatives,
+    max_alternative_lanes = demo_result$max_alternative_lanes
+  )
   
   demo_result$plot_runtime_seconds <- unname(
     proc.time()[["elapsed"]] - plot_start
