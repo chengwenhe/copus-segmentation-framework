@@ -20,8 +20,8 @@
 #     full manuscript pipeline, write files, or create global result objects.
 #   - Tertiary detectors run only on intervals left Unlabeled after
 #     primary/secondary precedence.
-#   - Detector logic and priority rules reproduce scripts 01, 02, 04, and 05.
 #   - COPUS intervals are treated as 2 minutes, matching the original pipeline.
+#   - Detector logic is refined and validated after running classroom video validation. 
 # ================================================================
 
 # ---- Minimal package requirements --------------------------------------------
@@ -185,30 +185,58 @@ empty_segment_table <- function() {
 }
 
 
+# Standard six-column output used by individual detector scanners. Candidate
+# collectors add `stage` only after detector outputs have been combined.
+empty_detector_segments <- function() {
+  tibble::tibble(
+    id = character(),
+    start_time = integer(),
+    end_time = integer(),
+    n_intervals = integer(),
+    minutes = integer(),
+    type = character()
+  )
+}
+
+
 # ---- Primary detector: Lecture -----------------------------------------------
+# Logic: contiguous intervals with Instructor.Lec AND Student.L.
+# Other simultaneous COPUS codes are allowed; one 2-min interval is sufficient.
 
 detect_lecture_segments <- function(df) {
-  df %>%
+  lecture_flagged <- df %>%
     dplyr::arrange(.data$id, .data$time) %>%
     dplyr::mutate(
-      lec_listen = (`Instructor.Lec` == 1) & (`Student.L` == 1)
+      phase_lecture = (`Instructor.Lec` == 1) & (`Student.L` == 1)
     ) %>%
     dplyr::group_by(.data$id) %>%
     dplyr::arrange(.data$time, .by_group = TRUE) %>%
     dplyr::mutate(
+      # Start a new run when time is not adjacent or lecture status changes.
       new_run = (dplyr::row_number() == 1L) |
         (.data$time != dplyr::lag(.data$time) + 1L) |
-        (.data$lec_listen != dplyr::lag(.data$lec_listen)),
+        (.data$phase_lecture != dplyr::lag(.data$phase_lecture)),
+      new_run = tidyr::replace_na(.data$new_run, TRUE),
       run_id = cumsum(.data$new_run)
     ) %>%
-    dplyr::ungroup() %>%
-    dplyr::filter(.data$lec_listen) %>%
+    dplyr::ungroup()
+  
+  lecture_rows <- lecture_flagged %>%
+    dplyr::filter(.data$phase_lecture)
+  
+  # A session may contain no Lecture intervals. Return the standard
+  # empty detector output before min()/max() so validation runs stay warning-free.
+  if (nrow(lecture_rows) == 0L) {
+    return(empty_detector_segments())
+  }
+  
+  lecture_rows %>%
     dplyr::group_by(.data$id, .data$run_id) %>%
     dplyr::summarise(
       start_time = min(.data$time),
       end_time = max(.data$time),
       n_intervals = dplyr::n(),
-      minutes = n_intervals * 2L,
+      minutes = dplyr::n() * 2L,
       type = "Lecture",
       .groups = "drop"
     ) %>%
@@ -220,19 +248,18 @@ detect_lecture_segments <- function(df) {
 
 build_clicker_flags <- function(df) {
   df %>%
-    arrange(id, time) %>%
-    mutate(
-      prompt_raw  = (`Instructor.CQ` == 1),
-      student_raw = (`Student.Ind` == 1) | (`Student.CG` == 1),
-      wrap_raw    = (`Instructor.FUp` == 1),
-      
-      # phase flags (allow overlaps; we keep them “raw” and enforce adjacency in the scanner)
-      phase_prompt  = prompt_raw,
-      phase_student = student_raw,
-      phase_wrap    = wrap_raw
+    dplyr::arrange(.data$id, .data$time) %>%
+    dplyr::mutate(
+      phase_prompt = (`Instructor.CQ` == 1),
+      phase_student = (`Student.Ind` == 1) | (`Student.CG` == 1),
+      phase_wrap = (`Instructor.FUp` == 1)
     )
 }
 
+# Logic:
+#   Prompt touches/precedes the LEFT boundary of Student response.
+#   Wrap touches/follows the RIGHT boundary of Student response.
+# Allows all three phases in one 2-min interval and overlapping boundaries.
 scan_clicker_one_id <- function(dd,
                                 min_prompt  = 1,
                                 min_student = 1,
@@ -241,6 +268,8 @@ scan_clicker_one_id <- function(dd,
                                 max_gap_sw  = 0   # Student→Wrap allowed gap
 ) {
   stopifnot(all(c("id","time","phase_prompt","phase_student","phase_wrap") %in% names(dd)))
+  
+  dd <- dd %>% dplyr::arrange(.data$time)
   
   n <- nrow(dd)
   i <- 1
@@ -254,39 +283,64 @@ scan_clicker_one_id <- function(dd,
     if (j > n) break
     stu_start <- j
     
-    # extend student block (contiguous)
+    # Extend the complete contiguous Student block.
     cnt <- 0; k <- stu_start
-    while (k <= n && dd$phase_student[k]) { cnt <- cnt + 1; k <- k + 1 }
+    while (
+      k <= n &&
+      dd$phase_student[k] &&
+      (k == stu_start || dd$time[k] == dd$time[k - 1] + 1L)
+    ) {
+      cnt <- cnt + 1
+      k <- k + 1
+    }
     if (cnt < min_student) { i <- k; next }
     stu_end <- k - 1
     
-    ## (2) NEAREST-PROMPT: pick CQ block immediately before (or overlapping) the student block
-    p_end <- stu_start - 1
-    if (dd$phase_prompt[stu_start]) p_end <- stu_start  # allow overlap
+    ## (2) Find nearest Prompt at/before the Student LEFT boundary.
+    p_end <- stu_start
     while (p_end >= i && !dd$phase_prompt[p_end]) p_end <- p_end - 1
     if (p_end < i) { i <- stu_end + 1; next }  # no prompt before/at student
     
     p_start <- p_end
-    while (p_start > i && dd$phase_prompt[p_start - 1]) p_start <- p_start - 1
+    while (
+      p_start > i &&
+      dd$phase_prompt[p_start - 1] &&
+      dd$time[p_start] == dd$time[p_start - 1] + 1L
+    ) {
+      p_start <- p_start - 1
+    }
     if ((p_end - p_start + 1) < min_prompt) { i <- stu_end + 1; next }
     
     # adjacency/overlap Prompt→Student
-    if (stu_start > (p_end + 1 + max_gap_ps)) { i <- stu_end + 1; next }
+    if (dd$time[stu_start] > (dd$time[p_end] + 1L + max_gap_ps)) {
+      i <- stu_end + 1
+      next
+    }
     
-    ## (3) Find WRAP at/after stu_start
-    k <- stu_start
+    ## (3) Find Wrap at/after the Student RIGHT boundary.
+    k <- stu_end
     while (k <= n && !dd$phase_wrap[k]) k <- k + 1
-    if (k > n) break
+    if (k > n) { i <- stu_end + 1; next }
     wrap_start <- k
     
-    # extend wrap block (contiguous)
+    # Extend contiguous Wrap block.
     cnt <- 0; m <- wrap_start
-    while (m <= n && dd$phase_wrap[m]) { cnt <- cnt + 1; m <- m + 1 }
-    if (cnt < min_wrap) { i <- m; next }
+    while (
+      m <= n &&
+      dd$phase_wrap[m] &&
+      (m == wrap_start || dd$time[m] == dd$time[m - 1] + 1L)
+    ) {
+      cnt <- cnt + 1
+      m <- m + 1
+    }
+    if (cnt < min_wrap) { i <- stu_end + 1; next }
     wrap_end <- m - 1
     
     # adjacency/overlap Student→Wrap
-    if (wrap_start > (stu_end + 1 + max_gap_sw)) { i <- wrap_end + 1; next }
+    if (dd$time[wrap_start] > (dd$time[stu_end] + 1L + max_gap_sw)) {
+      i <- stu_end + 1
+      next
+    }
     
     ## (4) Record segment (from prompt_start to wrap_end)
     seg_start_time <- dd$time[p_start]
@@ -295,8 +349,8 @@ scan_clicker_one_id <- function(dd,
       id          = dd$id[1],
       start_time  = seg_start_time,
       end_time    = seg_end_time,
-      n_intervals = seg_end_time - seg_start_time + 1,
-      minutes     = (seg_end_time - seg_start_time + 1) * 2,
+      n_intervals = wrap_end - p_start + 1L,
+      minutes     = (wrap_end - p_start + 1L) * 2L,
       type        = "Clicker"
     )
     
@@ -304,12 +358,7 @@ scan_clicker_one_id <- function(dd,
     i <- wrap_end + 1
   }
   
-  if (length(out) == 0) {
-    tibble::tibble(
-      id=character(), start_time=integer(), end_time=integer(),
-      n_intervals=integer(), minutes=integer(), type=character()
-    )
-  } else dplyr::bind_rows(out)
+  if (length(out) == 0) empty_detector_segments() else dplyr::bind_rows(out)
 }
 
 detect_clicker_segments <- function(df,
@@ -334,21 +383,22 @@ detect_clicker_segments <- function(df,
 
 build_tps_flags <- function(df) {
   df %>%
-    arrange(id, time) %>%
-    mutate(
-      prompt_raw = (`Instructor.PQ` == 1) | (`Instructor.CQ` == 1),
-      indiv_raw  = (`Student.Ind`  == 1),
-      group_raw  = (`Student.CG`   == 1) | (`Student.OG` == 1) | (`Student.WG` == 1),
-      share_raw  = (`Instructor.FUp` == 1) & ( (`Student.L` == 1) | (`Student.AnQ` == 1) ),
-      
-      # phase flags (allow overlaps; we keep them “raw” and enforce adjacency in the scanner)
-      phase_prompt = prompt_raw,
-      phase_indiv  = indiv_raw,
-      phase_group  = group_raw,
-      phase_share  = share_raw
+    dplyr::arrange(.data$id, .data$time) %>%
+    dplyr::mutate(
+      phase_prompt = (`Instructor.PQ` == 1) | (`Instructor.CQ` == 1),
+      phase_indiv = (`Student.Ind` == 1),
+      phase_group = (`Student.CG` == 1) | (`Student.OG` == 1) |
+        (`Student.WG` == 1),
+      phase_share = (`Instructor.FUp` == 1) &
+        ((`Student.L` == 1) | (`Student.AnQ` == 1))
     )
 }
 
+# Logic:
+#   Prompt touches/precedes Individual's LEFT boundary.
+#   Group touches/follows Individual's RIGHT boundary.
+#   Share touches/follows Group's RIGHT boundary.
+# Allows phase-boundary overlap, including all phases in one 2-min interval.
 scan_tps_one_id <- function(dd,
                             min_prompt = 1,
                             min_indiv  = 1,
@@ -360,6 +410,8 @@ scan_tps_one_id <- function(dd,
 ) {
   stopifnot(all(c("id","time",
                   "phase_prompt","phase_indiv","phase_group","phase_share") %in% names(dd)))
+  
+  dd <- dd %>% dplyr::arrange(.data$time)
   
   n <- nrow(dd)
   i <- 1
@@ -373,66 +425,100 @@ scan_tps_one_id <- function(dd,
     if (j > n) break
     indiv_start <- j
     
-    # extend indiv (contiguous)
+    # Extend complete contiguous Individual block.
     cnt <- 0; k <- indiv_start
-    while (k <= n && dd$phase_indiv[k]) { cnt <- cnt + 1; k <- k + 1 }
+    while (
+      k <= n &&
+      dd$phase_indiv[k] &&
+      (k == indiv_start || dd$time[k] == dd$time[k - 1] + 1L)
+    ) {
+      cnt <- cnt + 1
+      k <- k + 1
+    }
     if (cnt < min_indiv) { i <- k; next }
     indiv_end <- k - 1
     
-    ## (2) From indiv_start, find the NEAREST prompt block before (or overlapping) indiv
-    p_end <- indiv_start - 1
-    # if prompt overlaps indiv, allow p_end >= indiv_start
-    if (dd$phase_prompt[indiv_start]) p_end <- indiv_start
+    ## (2) Find nearest Prompt at/before Individual's LEFT boundary.
+    p_end <- indiv_start
     while (p_end >= i && !dd$phase_prompt[p_end]) p_end <- p_end - 1
     if (p_end < i) { i <- indiv_end + 1; next }   # no prompt before/at indiv
     
     p_start <- p_end
-    while (p_start > i && dd$phase_prompt[p_start - 1]) p_start <- p_start - 1
+    while (
+      p_start > i &&
+      dd$phase_prompt[p_start - 1] &&
+      dd$time[p_start] == dd$time[p_start - 1] + 1L
+    ) {
+      p_start <- p_start - 1
+    }
     if ((p_end - p_start + 1) < min_prompt) { i <- indiv_end + 1; next }
     
     # adjacency/overlap Prompt→Indiv
     # valid if indiv_start <= p_end (overlap) OR gap <= max_gap_pi
-    if (indiv_start > (p_end + 1 + max_gap_pi)) { i <- indiv_end + 1; next }
+    if (dd$time[indiv_start] > (dd$time[p_end] + 1L + max_gap_pi)) {
+      i <- indiv_end + 1
+      next
+    }
     
-    ## (3) Find GROUP block at/after indiv_start
-    k <- indiv_start
+    ## (3) Find Group at/after Individual's RIGHT boundary.
+    k <- indiv_end
     while (k <= n && !dd$phase_group[k]) k <- k + 1
-    if (k > n) break
+    if (k > n) { i <- indiv_end + 1; next }
     group_start <- k
     
-    # extend group (contiguous)
+    # Extend complete contiguous Group block.
     cnt <- 0; m <- group_start
-    while (m <= n && dd$phase_group[m]) { cnt <- cnt + 1; m <- m + 1 }
-    if (cnt < min_group) { i <- m; next }
+    while (
+      m <= n &&
+      dd$phase_group[m] &&
+      (m == group_start || dd$time[m] == dd$time[m - 1] + 1L)
+    ) {
+      cnt <- cnt + 1
+      m <- m + 1
+    }
+    if (cnt < min_group) { i <- indiv_end + 1; next }
     group_end <- m - 1
     
     # adjacency/overlap Indiv→Group
-    if (group_start > (indiv_end + 1 + max_gap_ig)) { i <- group_end + 1; next }
+    if (dd$time[group_start] > (dd$time[indiv_end] + 1L + max_gap_ig)) {
+      i <- indiv_end + 1
+      next
+    }
     
-    ## (4) Find SHARE block at/after group_start
-    m <- group_start
+    ## (4) Find Share at/after Group's RIGHT boundary.
+    m <- group_end
     while (m <= n && !dd$phase_share[m]) m <- m + 1
-    if (m > n) break
+    if (m > n) { i <- indiv_end + 1; next }
     share_start <- m
     
-    # extend share (contiguous)
+    # Extend contiguous Share block.
     cnt <- 0; q <- share_start
-    while (q <= n && dd$phase_share[q]) { cnt <- cnt + 1; q <- q + 1 }
-    if (cnt < min_share) { i <- q; next }
+    while (
+      q <= n &&
+      dd$phase_share[q] &&
+      (q == share_start || dd$time[q] == dd$time[q - 1] + 1L)
+    ) {
+      cnt <- cnt + 1
+      q <- q + 1
+    }
+    if (cnt < min_share) { i <- indiv_end + 1; next }
     share_end <- q - 1
     
     # adjacency/overlap Group→Share
-    if (share_start > (group_end + 1 + max_gap_gs)) { i <- share_end + 1; next }
+    if (dd$time[share_start] > (dd$time[group_end] + 1L + max_gap_gs)) {
+      i <- indiv_end + 1
+      next
+    }
     
     ## (5) Record segment from prompt_start to share_end
     seg_start_time <- dd$time[p_start]
     seg_end_time   <- dd$time[share_end]
-    out[[length(out) + 1]] <- tibble(
+    out[[length(out) + 1]] <- tibble::tibble(
       id          = dd$id[1],
       start_time  = seg_start_time,
       end_time    = seg_end_time,
-      n_intervals = seg_end_time - seg_start_time + 1,
-      minutes     = (seg_end_time - seg_start_time + 1) * 2,
+      n_intervals = share_end - p_start + 1L,
+      minutes     = (share_end - p_start + 1L) * 2L,
       type        = "TPS"
     )
     
@@ -440,10 +526,7 @@ scan_tps_one_id <- function(dd,
     i <- share_end + 1
   }
   
-  if (length(out) == 0) {
-    tibble(id=character(), start_time=integer(), end_time=integer(),
-           n_intervals=integer(), minutes=integer(), type=character())
-  } else dplyr::bind_rows(out)
+  if (length(out) == 0) empty_detector_segments() else dplyr::bind_rows(out)
 }
 
 detect_tps_segments <- function(df,
@@ -457,29 +540,33 @@ detect_tps_segments <- function(df,
   df2 <- build_tps_flags(df)
   
   df2 %>%
-    group_by(id) %>%
-    group_split() %>%
-    map_dfr(~ scan_tps_one_id(.x,
-                              min_prompt = min_prompt,
-                              min_indiv  = min_indiv,
-                              min_group  = min_group,
-                              min_share  = min_share,
-                              max_gap_pi = max_gap_pi,
-                              max_gap_ig = max_gap_ig,
-                              max_gap_gs = max_gap_gs)) %>%
-    arrange(id, start_time)
+    dplyr::group_by(.data$id) %>%
+    dplyr::group_split() %>%
+    purrr::map_dfr(~ scan_tps_one_id(.x,
+                                     min_prompt = min_prompt,
+                                     min_indiv  = min_indiv,
+                                     min_group  = min_group,
+                                     min_share  = min_share,
+                                     max_gap_pi = max_gap_pi,
+                                     max_gap_ig = max_gap_ig,
+                                     max_gap_gs = max_gap_gs)) %>%
+    dplyr::arrange(.data$id, .data$start_time)
 }
 
 build_pi_flags <- function(df) {
   df %>%
-    arrange(id, time) %>%
-    mutate(
+    dplyr::arrange(.data$id, .data$time) %>%
+    dplyr::mutate(
       phase_prompt  = (`Instructor.CQ` == 1) | (`Instructor.PQ` == 1),
       phase_discuss = (`Student.CG` == 1) | (`Student.OG` == 1) | (`Student.WG` == 1),
       phase_wrap    = (`Instructor.FUp` == 1)
     )
 }
 
+# Logic:
+#   Prompt touches/precedes Discussion's LEFT boundary.
+#   Wrap touches/follows Discussion's RIGHT boundary.
+# Allows all phases in one 2-min interval and multiple overlapping boundaries.
 scan_pi_one_id <- function(dd,
                            min_prompt  = 1,
                            min_discuss = 1,
@@ -488,6 +575,8 @@ scan_pi_one_id <- function(dd,
                            max_gap_dw  = 0   # max allowed gap between Discuss end and Wrap start
 ) {
   stopifnot(all(c("id","time","phase_prompt","phase_discuss","phase_wrap") %in% names(dd)))
+  
+  dd <- dd %>% dplyr::arrange(.data$time)
   n <- nrow(dd)
   i <- 1
   out <- list()
@@ -500,51 +589,76 @@ scan_pi_one_id <- function(dd,
     if (j > n) break
     discuss_start <- j
     
-    # extend contiguous discuss block
+    # Extend complete contiguous Discussion block.
     cnt <- 0; k <- discuss_start
-    while (k <= n && dd$phase_discuss[k]) { cnt <- cnt + 1; k <- k + 1 }
+    while (
+      k <= n &&
+      dd$phase_discuss[k] &&
+      (k == discuss_start || dd$time[k] == dd$time[k - 1] + 1L)
+    ) {
+      cnt <- cnt + 1
+      k <- k + 1
+    }
     if (cnt < min_discuss) { i <- k; next }
     discuss_end <- k - 1
     
-    ## 2) Find the NEAREST Prompt block that ends immediately before (or overlaps) this discuss block
-    # search backward from discuss_start-1 for the last TRUE in phase_prompt
-    p_end <- discuss_start - 1
+    ## 2) Find nearest Prompt at/before Discussion's LEFT boundary.
+    p_end <- discuss_start
     while (p_end >= i && !dd$phase_prompt[p_end]) p_end <- p_end - 1
-    if (p_end < i) { i <- discuss_end + 1; next }  # no prompt before discuss
+    if (p_end < i) { i <- discuss_end + 1; next }
     
-    # walk backward to get contiguous prompt block
+    # Walk backward through the contiguous Prompt block.
     p_start <- p_end
-    while (p_start > i && dd$phase_prompt[p_start - 1]) p_start <- p_start - 1
+    while (
+      p_start > i &&
+      dd$phase_prompt[p_start - 1] &&
+      dd$time[p_start] == dd$time[p_start - 1] + 1L
+    ) {
+      p_start <- p_start - 1
+    }
     if ((p_end - p_start + 1) < min_prompt) { i <- discuss_end + 1; next }
     
     # adjacency/overlap constraint Prompt→Discuss:
     # allow overlap (discuss_start <= p_end) OR a small gap <= max_gap_pd
-    if (discuss_start > (p_end + 1 + max_gap_pd)) { i <- discuss_end + 1; next }
+    if (dd$time[discuss_start] > (dd$time[p_end] + 1L + max_gap_pd)) {
+      i <- discuss_end + 1
+      next
+    }
     
-    ## 3) Find WRAP at/after discuss_start
-    k <- discuss_start
+    ## 3) Find Wrap at/after Discussion's RIGHT boundary.
+    k <- discuss_end
     while (k <= n && !dd$phase_wrap[k]) k <- k + 1
-    if (k > n) break
+    if (k > n) { i <- discuss_end + 1; next }
     wrap_start <- k
     
-    # extend contiguous wrap block
+    # Extend contiguous Wrap block.
     cnt <- 0; m <- wrap_start
-    while (m <= n && dd$phase_wrap[m]) { cnt <- cnt + 1; m <- m + 1 }
-    if (cnt < min_wrap) { i <- m; next }
+    while (
+      m <= n &&
+      dd$phase_wrap[m] &&
+      (m == wrap_start || dd$time[m] == dd$time[m - 1] + 1L)
+    ) {
+      cnt <- cnt + 1
+      m <- m + 1
+    }
+    if (cnt < min_wrap) { i <- discuss_end + 1; next }
     wrap_end <- m - 1
     
     # adjacency/overlap constraint Discuss→Wrap:
-    if (wrap_start > (discuss_end + 1 + max_gap_dw)) { i <- wrap_end + 1; next }
+    if (dd$time[wrap_start] > (dd$time[discuss_end] + 1L + max_gap_dw)) {
+      i <- discuss_end + 1
+      next
+    }
     
     ## 4) Record segment from prompt_start to wrap_end
     seg_start_time <- dd$time[p_start]
     seg_end_time   <- dd$time[wrap_end]
-    out[[length(out) + 1]] <- tibble(
+    out[[length(out) + 1]] <- tibble::tibble(
       id          = dd$id[1],
       start_time  = seg_start_time,
       end_time    = seg_end_time,
-      n_intervals = seg_end_time - seg_start_time + 1,
-      minutes     = (seg_end_time - seg_start_time + 1) * 2,
+      n_intervals = wrap_end - p_start + 1L,
+      minutes     = (wrap_end - p_start + 1L) * 2L,
       type        = "PeerInstruction"
     )
     
@@ -552,10 +666,7 @@ scan_pi_one_id <- function(dd,
     i <- wrap_end + 1
   }
   
-  if (length(out) == 0) {
-    tibble(id=character(), start_time=integer(), end_time=integer(),
-           n_intervals=integer(), minutes=integer(), type=character())
-  } else dplyr::bind_rows(out)
+  if (length(out) == 0) empty_detector_segments() else dplyr::bind_rows(out)
 }
 
 detect_pi_segments <- function(df,
@@ -567,31 +678,38 @@ detect_pi_segments <- function(df,
   df2 <- build_pi_flags(df)
   
   df2 %>%
-    group_by(id) %>%
-    group_split() %>%
-    map_dfr(~ scan_pi_one_id(.x,
-                             min_prompt  = min_prompt,
-                             min_discuss = min_discuss,
-                             min_wrap    = min_wrap,
-                             max_gap_pd  = max_gap_pd,
-                             max_gap_dw  = max_gap_dw)) %>%
-    arrange(id, start_time)
+    dplyr::group_by(.data$id) %>%
+    dplyr::group_split() %>%
+    purrr::map_dfr(~ scan_pi_one_id(.x,
+                                    min_prompt  = min_prompt,
+                                    min_discuss = min_discuss,
+                                    min_wrap    = min_wrap,
+                                    max_gap_pd  = max_gap_pd,
+                                    max_gap_dw  = max_gap_dw)) %>%
+    dplyr::arrange(.data$id, .data$start_time)
 }
 
 build_peerlite_flags <- function(df) {
   df %>%
-    arrange(id, time) %>%
-    mutate(
+    dplyr::arrange(.data$id, .data$time) %>%
+    dplyr::mutate(
       phase_prompt  = (`Instructor.PQ` == 1) | (`Instructor.CQ` == 1),
       phase_discuss = (`Student.OG` == 1) | (`Student.WG` == 1) | (`Student.CG` == 1),
       phase_FUp     = (`Instructor.FUp` == 1)
     )
 }
 
+# Logic:
+#   Find the complete Discussion block first (Discussion-anchored).
+#   Prompt must touch/precede Discussion's LEFT boundary.
+#   No FUp may occur during or immediately after Discussion.
 scan_peerlite_one_id <- function(dd,
                                  min_prompt  = 1,
-                                 min_discuss = 1) {
+                                 min_discuss = 1,
+                                 max_gap_pd  = 0) {
   stopifnot(all(c("id","time","phase_prompt","phase_discuss","phase_FUp") %in% names(dd)))
+  
+  dd <- dd %>% dplyr::arrange(.data$time)
   
   n   <- nrow(dd)
   i   <- 1
@@ -599,112 +717,125 @@ scan_peerlite_one_id <- function(dd,
   
   while (i <= n) {
     
-    ## (A) Find the next PROMPT block (the "head")
-    p <- i
-    while (p <= n && !dd$phase_prompt[p]) p <- p + 1
-    if (p > n) break
+    ## (A) Find and extend the next complete Discussion block.
+    j <- i
+    while (j <= n && !dd$phase_discuss[j]) j <- j + 1
+    if (j > n) break
+    discuss_start <- j
     
-    p_start <- p
-    p_end <- p
-    while (p_end < n && dd$phase_prompt[p_end + 1]) p_end <- p_end + 1
-    
-    if ((p_end - p_start + 1) < min_prompt) {
-      i <- p_end + 1
-      next
-    }
-    
-    ## (B) Body start rule:
-    ##     Discussion can start within [p_start, p_end] OR at p_end + 1
-    discuss_start <- NA_integer_
-    
-    # overlap anywhere in prompt block
-    overlap_idx <- which(dd$phase_discuss[p_start:p_end])
-    if (length(overlap_idx) > 0) {
-      discuss_start <- p_start + min(overlap_idx) - 1
-    } else if (p_end < n && dd$phase_discuss[p_end + 1]) {
-      # adjacent immediately after prompt block
-      discuss_start <- p_end + 1
-    } else {
-      # prompt not followed by discussion in/adjacent -> not PeerLite
-      i <- p_end + 1
-      next
-    }
-    
-    ## (C) Extend contiguous discussion block
-    k <- discuss_start
-    cnt <- 0
-    while (k <= n && dd$phase_discuss[k]) { cnt <- cnt + 1; k <- k + 1 }
-    if (cnt < min_discuss) {
-      i <- k
-      next
+    cnt <- 0; k <- discuss_start
+    while (
+      k <= n &&
+      dd$phase_discuss[k] &&
+      (k == discuss_start || dd$time[k] == dd$time[k - 1] + 1L)
+    ) {
+      cnt <- cnt + 1
+      k <- k + 1
     }
     discuss_end <- k - 1
     
-    ## (D) Exclude if FUp occurs during discussion OR immediately after it
+    if (cnt < min_discuss) { i <- discuss_end + 1; next }
+    
+    ## (B) Find nearest Prompt at/before Discussion's LEFT boundary.
+    p_end <- discuss_start
+    while (p_end >= i && !dd$phase_prompt[p_end]) p_end <- p_end - 1
+    if (p_end < i) { i <- discuss_end + 1; next }
+    
+    p_start <- p_end
+    while (
+      p_start > i &&
+      dd$phase_prompt[p_start - 1] &&
+      dd$time[p_start] == dd$time[p_start - 1] + 1L
+    ) {
+      p_start <- p_start - 1
+    }
+    
+    if ((p_end - p_start + 1L) < min_prompt) {
+      i <- discuss_end + 1
+      next
+    }
+    
+    if (dd$time[discuss_start] > (dd$time[p_end] + 1L + max_gap_pd)) {
+      i <- discuss_end + 1
+      next
+    }
+    
+    ## (C) Exclude FUp during Discussion or in the immediately following bin.
     if (any(dd$phase_FUp[discuss_start:discuss_end])) {
       i <- discuss_end + 1
       next
     }
-    if (discuss_end < n && dd$phase_FUp[discuss_end + 1]) {
+    
+    if (
+      discuss_end < n &&
+      dd$time[discuss_end + 1] == dd$time[discuss_end] + 1L &&
+      dd$phase_FUp[discuss_end + 1]
+    ) {
       i <- discuss_end + 1
       next
     }
     
-    ## (E) Record the PeerLite episode
-    seg_start_time <- dd$time[p_start]       # anchor start at prompt (head)
-    seg_end_time   <- dd$time[discuss_end]   # end at discussion end (body)
+    ## (D) Record from Prompt start through Discussion end.
+    seg_start_time <- dd$time[p_start]
+    seg_end_time   <- dd$time[discuss_end]
     
-    out[[length(out) + 1]] <- tibble(
+    out[[length(out) + 1]] <- tibble::tibble(
       id          = dd$id[1],
       start_time  = seg_start_time,
       end_time    = seg_end_time,
-      n_intervals = seg_end_time - seg_start_time + 1,
-      minutes     = (seg_end_time - seg_start_time + 1) * 2,
+      n_intervals = discuss_end - p_start + 1L,
+      minutes     = (discuss_end - p_start + 1L) * 2L,
       type        = "PeerLite"
     )
     
-    ## (F) Move cursor forward:
-    # This ensures we DO NOT capture multiple short episodes within the same
-    # contiguous discussion run. We only keep the first prompt-anchored episode.
+    ## (E) Move past the complete Discussion block.
     i <- discuss_end + 1
   }
   
   if (length(out) == 0) {
-    tibble(id=character(), start_time=integer(), end_time=integer(),
-           n_intervals=integer(), minutes=integer(), type=character())
+    empty_detector_segments()
   } else {
-    dplyr::bind_rows(out) %>% arrange(id, start_time)
+    dplyr::bind_rows(out) %>% dplyr::arrange(.data$id, .data$start_time)
   }
 }
 
 detect_peer_lite_segments <- function(df,
                                       min_prompt  = 1,
-                                      min_discuss = 1) {
+                                      min_discuss = 1,
+                                      max_gap_pd  = 0) {
   df2 <- build_peerlite_flags(df)
   
   df2 %>%
-    group_by(id) %>%
-    group_split() %>%
+    dplyr::group_by(.data$id) %>%
+    dplyr::group_split() %>%
     purrr::map_dfr(~ scan_peerlite_one_id(.x,
                                           min_prompt  = min_prompt,
-                                          min_discuss = min_discuss)) %>%
-    arrange(id, start_time)
+                                          min_discuss = min_discuss,
+                                          max_gap_pd  = max_gap_pd)) %>%
+    dplyr::arrange(.data$id, .data$start_time)
 }
 
 build_clickerlite_flags <- function(df) {
   df %>%
-    arrange(id, time) %>%
-    mutate(
+    dplyr::arrange(.data$id, .data$time) %>%
+    dplyr::mutate(
       phase_prompt  = (`Instructor.CQ` == 1),
       phase_student = (`Student.Ind` == 1) | (`Student.CG` == 1),
       phase_FUp     = (`Instructor.FUp` == 1)
     )
 }
 
+# Logic:
+#   Find the complete Student-response block first (Student-anchored).
+#   CQ Prompt must touch/precede Student's LEFT boundary.
+#   No FUp may occur during or immediately after Student response.
 scan_clickerlite_one_id <- function(dd,
                                     min_prompt  = 1,
-                                    min_student = 1) {
+                                    min_student = 1,
+                                    max_gap_ps  = 0) {
   stopifnot(all(c("id","time","phase_prompt","phase_student","phase_FUp") %in% names(dd)))
+  
+  dd <- dd %>% dplyr::arrange(.data$time)
   
   n   <- nrow(dd)
   i   <- 1
@@ -712,101 +843,108 @@ scan_clickerlite_one_id <- function(dd,
   
   while (i <= n) {
     
-    ## (A) Find the next PROMPT block (the "head": Instructor.CQ)
-    p <- i
-    while (p <= n && !dd$phase_prompt[p]) p <- p + 1
-    if (p > n) break
+    ## (A) Find and extend the next complete Student-response block.
+    j <- i
+    while (j <= n && !dd$phase_student[j]) j <- j + 1
+    if (j > n) break
+    student_start <- j
     
-    p_start <- p
-    p_end <- p
-    while (p_end < n && dd$phase_prompt[p_end + 1]) p_end <- p_end + 1
-    
-    if ((p_end - p_start + 1) < min_prompt) {
-      i <- p_end + 1
-      next
-    }
-    
-    ## (B) Body start rule (v3):
-    ##     Student phase can start within [p_start, p_end] OR at p_end + 1
-    student_start <- NA_integer_
-    
-    # overlap anywhere in prompt block
-    overlap_idx <- which(dd$phase_student[p_start:p_end])
-    if (length(overlap_idx) > 0) {
-      student_start <- p_start + min(overlap_idx) - 1
-    } else if (p_end < n && dd$phase_student[p_end + 1]) {
-      # adjacent immediately after prompt block
-      student_start <- p_end + 1
-    } else {
-      # prompt not followed by student response in/adjacent -> not ClickerLite
-      i <- p_end + 1
-      next
-    }
-    
-    ## (C) Extend contiguous student block
-    k <- student_start
-    cnt <- 0
-    while (k <= n && dd$phase_student[k]) { cnt <- cnt + 1; k <- k + 1 }
-    if (cnt < min_student) {
-      i <- k
-      next
+    cnt <- 0; k <- student_start
+    while (
+      k <= n &&
+      dd$phase_student[k] &&
+      (k == student_start || dd$time[k] == dd$time[k - 1] + 1L)
+    ) {
+      cnt <- cnt + 1
+      k <- k + 1
     }
     student_end <- k - 1
     
-    ## (D) Exclude if FUp occurs during student block OR immediately after it
+    if (cnt < min_student) { i <- student_end + 1; next }
+    
+    ## (B) Find nearest CQ Prompt at/before Student's LEFT boundary.
+    p_end <- student_start
+    while (p_end >= i && !dd$phase_prompt[p_end]) p_end <- p_end - 1
+    if (p_end < i) { i <- student_end + 1; next }
+    
+    p_start <- p_end
+    while (
+      p_start > i &&
+      dd$phase_prompt[p_start - 1] &&
+      dd$time[p_start] == dd$time[p_start - 1] + 1L
+    ) {
+      p_start <- p_start - 1
+    }
+    
+    if ((p_end - p_start + 1L) < min_prompt) {
+      i <- student_end + 1
+      next
+    }
+    
+    if (dd$time[student_start] > (dd$time[p_end] + 1L + max_gap_ps)) {
+      i <- student_end + 1
+      next
+    }
+    
+    ## (C) Exclude FUp during Student response or immediately after it.
     if (any(dd$phase_FUp[student_start:student_end])) {
       i <- student_end + 1
       next
     }
-    if (student_end < n && dd$phase_FUp[student_end + 1]) {
+    
+    if (
+      student_end < n &&
+      dd$time[student_end + 1] == dd$time[student_end] + 1L &&
+      dd$phase_FUp[student_end + 1]
+    ) {
       i <- student_end + 1
       next
     }
     
-    ## (E) Record ClickerLite episode: head -> body end
-    seg_start_time <- dd$time[p_start]       # start at prompt block start
-    seg_end_time   <- dd$time[student_end]   # end at student phase end
+    ## (D) Record from Prompt start through Student-response end.
+    seg_start_time <- dd$time[p_start]
+    seg_end_time   <- dd$time[student_end]
     
-    out[[length(out) + 1]] <- tibble(
+    out[[length(out) + 1]] <- tibble::tibble(
       id          = dd$id[1],
       start_time  = seg_start_time,
       end_time    = seg_end_time,
-      n_intervals = seg_end_time - seg_start_time + 1,
-      minutes     = (seg_end_time - seg_start_time + 1) * 2,
+      n_intervals = student_end - p_start + 1L,
+      minutes     = (student_end - p_start + 1L) * 2L,
       type        = "ClickerLite"
     )
     
-    ## (F) Advance cursor: keep only the FIRST CQ-anchored episode
-    ##     within this contiguous student-response run
+    ## (E) Move past the complete Student-response block.
     i <- student_end + 1
   }
   
   if (length(out) == 0) {
-    tibble(id=character(), start_time=integer(), end_time=integer(),
-           n_intervals=integer(), minutes=integer(), type=character())
+    empty_detector_segments()
   } else {
-    dplyr::bind_rows(out) %>% arrange(id, start_time)
+    dplyr::bind_rows(out) %>% dplyr::arrange(.data$id, .data$start_time)
   }
 }
 
 detect_clicker_lite_segments <- function(df,
                                          min_prompt  = 1,
-                                         min_student = 1) {
+                                         min_student = 1,
+                                         max_gap_ps  = 0) {
   df2 <- build_clickerlite_flags(df)
   
   df2 %>%
-    group_by(id) %>%
-    group_split() %>%
+    dplyr::group_by(.data$id) %>%
+    dplyr::group_split() %>%
     purrr::map_dfr(~ scan_clickerlite_one_id(.x,
                                              min_prompt  = min_prompt,
-                                             min_student = min_student)) %>%
-    arrange(id, start_time)
+                                             min_student = min_student,
+                                             max_gap_ps  = max_gap_ps)) %>%
+    dplyr::arrange(.data$id, .data$start_time)
 }
 
 build_admin_flags <- function(df) {
   df %>%
-    arrange(id, time) %>%
-    mutate(
+    dplyr::arrange(.data$id, .data$time) %>%
+    dplyr::mutate(
       phase_admin = (`Instructor.Adm` == 1)
     )
 }
@@ -815,6 +953,8 @@ scan_admin_one_id <- function(dd,
                               min_admin = 1) {
   
   stopifnot(all(c("id","time","phase_admin") %in% names(dd)))
+  
+  dd <- dd %>% dplyr::arrange(.data$time)
   
   n   <- nrow(dd)
   i   <- 1
@@ -829,9 +969,16 @@ scan_admin_one_id <- function(dd,
     
     admin_start <- j
     
-    # extend contiguous admin block
+    # Extend a truly contiguous Admin block.
     cnt <- 0; k <- admin_start
-    while (k <= n && dd$phase_admin[k]) { cnt <- cnt + 1; k <- k + 1 }
+    while (
+      k <= n &&
+      dd$phase_admin[k] &&
+      (k == admin_start || dd$time[k] == dd$time[k - 1] + 1L)
+    ) {
+      cnt <- cnt + 1
+      k <- k + 1
+    }
     if (cnt < min_admin) { i <- k; next }
     
     admin_end <- k - 1
@@ -840,12 +987,12 @@ scan_admin_one_id <- function(dd,
     seg_start_time <- dd$time[admin_start]
     seg_end_time   <- dd$time[admin_end]
     
-    out[[length(out) + 1]] <- tibble(
+    out[[length(out) + 1]] <- tibble::tibble(
       id          = dd$id[1],
       start_time  = seg_start_time,
       end_time    = seg_end_time,
-      n_intervals = seg_end_time - seg_start_time + 1,
-      minutes     = (seg_end_time - seg_start_time + 1) * 2,
+      n_intervals = cnt,
+      minutes     = cnt * 2L,
       type        = "Admin"
     )
     
@@ -853,13 +1000,7 @@ scan_admin_one_id <- function(dd,
     i <- admin_end + 1
   }
   
-  # Return output
-  if (length(out) == 0) {
-    tibble(
-      id=character(), start_time=integer(), end_time=integer(),
-      n_intervals=integer(), minutes=integer(), type=character()
-    )
-  } else dplyr::bind_rows(out)
+  if (length(out) == 0) empty_detector_segments() else dplyr::bind_rows(out)
 }
 
 detect_admin_segments <- function(df,
@@ -868,126 +1009,98 @@ detect_admin_segments <- function(df,
   df2 <- build_admin_flags(df)
   
   df2 %>%
-    group_by(id) %>%
-    group_split() %>%
-    map_dfr(~ scan_admin_one_id(.x,
-                                min_admin = min_admin)) %>%
-    arrange(id, start_time)
+    dplyr::group_by(.data$id) %>%
+    dplyr::group_split() %>%
+    purrr::map_dfr(~ scan_admin_one_id(.x,
+                                       min_admin = min_admin)) %>%
+    dplyr::arrange(.data$id, .data$start_time)
 }
 
 build_student_work_flags <- function(df) {
   df %>%
-    arrange(id, time) %>%
-    mutate(
+    dplyr::arrange(.data$id, .data$time) %>%
+    dplyr::mutate(
+      # PAM-derived pattern: instructor circulates or interacts one-on-one
+      # while students work individually or in non-CG groups.
       phase_work =
         ( (`Instructor.MG` == 1) | (`Instructor.1o1` == 1) ) &
-        ( (`Student.OG` == 1) | (`Student.WG` == 1) | (`Student.Ind` == 1) ),
-      
-      phase_prompt =
-        (`Instructor.PQ` == 1) | (`Instructor.CQ` == 1),
-      
-      # IMPORTANT: prompt bins cannot START student work
-      phase_work_start = phase_work & !phase_prompt
+        ( (`Student.OG` == 1) | (`Student.WG` == 1) | (`Student.Ind` == 1) )
     )
 }
 
-scan_student_work_one_id <- function(dd) {
-  needed <- c("id","time","phase_work","phase_work_start","phase_prompt")
+scan_student_work_one_id <- function(dd,
+                                     min_work = 1) {
+  needed <- c("id", "time", "phase_work")
   stopifnot(all(needed %in% names(dd)))
   
-  dd <- dd %>% arrange(time)
+  dd <- dd %>% dplyr::arrange(.data$time)
   n <- nrow(dd)
   i <- 1
   out <- list()
   
   while (i <= n) {
     
-    # (A) find first legal START (work but NOT prompt)
+    # (A) Find the next Student Work interval.
     j <- i
-    while (j <= n && !dd$phase_work_start[j]) j <- j + 1
+    while (j <= n && !dd$phase_work[j]) j <- j + 1
     if (j > n) break
     run_start <- j
     
-    # (B) extend contiguous WORK run (still uses phase_work)
+    # (B) Extend the contiguous Student Work run.
     k <- run_start
-    while (k <= n && dd$phase_work[k]) k <- k + 1
+    while (
+      k <= n &&
+      dd$phase_work[k] &&
+      (k == run_start || dd$time[k] == dd$time[k - 1] + 1L)
+    ) {
+      k <- k + 1
+    }
     run_end <- k - 1
     
-    # (C) RIGHT-BEFORE exclusion implemented as "slide start forward"
-    # If the bin RIGHT BEFORE run_start is a prompt, we do NOT discard the whole run.
-    # Instead, push start forward to the first bin inside the run whose previous bin is NOT a prompt.
-    if (run_start > 1 && dd$phase_prompt[run_start - 1]) {
-      s <- run_start + 1
-      while (s <= run_end && dd$phase_prompt[s - 1]) s <- s + 1
-      run_start <- s
-    }
+    segment_length <- run_end - run_start + 1L
     
-    # If sliding pushes start beyond run_end, skip this run
-    if (run_start > run_end) {
-      i <- run_end + 1
-      next
-    }
-    
-    # (D) STOP at first prompt inside run (cut BEFORE that bin)
-    prompt_idx_rel <- which(dd$phase_prompt[run_start:run_end])
-    if (length(prompt_idx_rel) > 0) {
-      first_prompt_abs <- run_start + prompt_idx_rel[1] - 1
-      seg_end <- first_prompt_abs - 1
-    } else {
-      first_prompt_abs <- NA_integer_
-      seg_end <- run_end
-    }
-    
-    # (E) record if segment is valid
-    if (seg_end >= run_start) {
+    # (C) Record; PQ/CQ do not exclude, start, split, or stop this pattern.
+    if (segment_length >= min_work) {
       out[[length(out) + 1]] <- tibble::tibble(
         id          = dd$id[1],
         start_time  = dd$time[run_start],
-        end_time    = dd$time[seg_end],
-        n_intervals = dd$time[seg_end] - dd$time[run_start] + 1,
-        minutes     = (dd$time[seg_end] - dd$time[run_start] + 1) * 2,
+        end_time    = dd$time[run_end],
+        n_intervals = segment_length,
+        minutes     = segment_length * 2L,
         type        = "StudentWork"
       )
     }
     
-    # (F) advance cursor
-    if (!is.na(first_prompt_abs)) {
-      i <- first_prompt_abs  # land on prompt bin and keep scanning from there
-    } else {
-      i <- run_end + 1
-    }
+    # (D) Advance past this complete run.
+    i <- run_end + 1
   }
   
-  if (length(out) == 0) {
-    tibble::tibble(
-      id=character(), start_time=integer(), end_time=integer(),
-      n_intervals=integer(), minutes=integer(), type=character()
-    )
-  } else dplyr::bind_rows(out)
+  if (length(out) == 0) empty_detector_segments() else dplyr::bind_rows(out)
 }
 
-detect_student_work_segments <- function(df) {
+detect_student_work_segments <- function(df,
+                                         min_work = 1) {
   df2 <- build_student_work_flags(df)
   
   df2 %>%
-    dplyr::group_by(id) %>%
+    dplyr::group_by(.data$id) %>%
     dplyr::group_split() %>%
-    purrr::map_dfr(~ scan_student_work_one_id(.x)) %>%
-    dplyr::arrange(id, start_time)
+    purrr::map_dfr(~ scan_student_work_one_id(.x, min_work = min_work)) %>%
+    dplyr::arrange(.data$id, .data$start_time)
 }
 
 # ---- Collect primary and secondary candidates --------------------------------
 
 detect_primary_secondary_candidates <- function(dat) {
   candidates <- dplyr::bind_rows(
-    detect_lecture_segments(dat),
-    detect_clicker_segments(dat),
     detect_tps_segments(dat),
     detect_pi_segments(dat),
-    detect_peer_lite_segments(dat),
-    detect_clicker_lite_segments(dat),
-    detect_admin_segments(dat),
-    detect_student_work_segments(dat)
+    detect_clicker_segments(dat),
+    detect_peer_lite_segments(dat, max_gap_pd = 0),
+    detect_clicker_lite_segments(dat, max_gap_ps = 0),
+    detect_student_work_segments(dat, min_work = 1),
+    detect_lecture_segments(dat),
+    detect_admin_segments(dat, min_admin = 1)
   )
   
   if (nrow(candidates) == 0L) {
@@ -1185,16 +1298,19 @@ apply_primary_secondary_priority <- function(dat, candidate_segments) {
 
 build_instructorQA_flags <- function(df_block) {
   df_block %>%
-    arrange(time) %>%
-    mutate(
-      # anchor: instructor poses or follows up on a question; students listen or answer
+    dplyr::arrange(.data$time) %>%
+    dplyr::mutate(
+      # Anchor: PQ initiates the exchange; FUp cannot initiate it.
       anchor_instructorQA =
-        ((`Instructor.PQ` == 1) | (`Instructor.FUp` == 1) ) & ( (`Student.AnQ` == 1) | (`Student.L` == 1) ),
+        (`Instructor.PQ` == 1) &
+        ((`Student.AnQ` == 1) | (`Student.L` == 1)),
       
-      # continue: PQ/FUp/RtW/AnQ allowed; students L or AnQ or asking questions
+      # FUp/RtW/AnQ may continue an exchange already anchored by PQ.
       cont_instructorQA =
-        ( (`Instructor.PQ` == 1) | (`Instructor.FUp` == 1) | (`Instructor.RtW` == 1) |  (`Instructor.AnQ` == 1)  ) &
-        ( (`Student.AnQ` == 1) | (`Student.SQ` == 1) |  (`Student.L` == 1) )
+        ( (`Instructor.PQ` == 1) | (`Instructor.FUp` == 1) |
+            (`Instructor.RtW` == 1) | (`Instructor.AnQ` == 1) ) &
+        ( (`Student.AnQ` == 1) | (`Student.SQ` == 1) |
+            (`Student.L` == 1) )
     )
 }
 
@@ -1202,7 +1318,7 @@ scan_instructorQA_one_block <- function(dd_block,
                                         min_len = 1) {
   stopifnot(all(c("id","time","anchor_instructorQA","cont_instructorQA") %in% names(dd_block)))
   
-  dd_block <- dd_block %>% arrange(time)
+  dd_block <- dd_block %>% dplyr::arrange(.data$time)
   n <- nrow(dd_block)
   i <- 1
   out <- list()
@@ -1215,19 +1331,27 @@ scan_instructorQA_one_block <- function(dd_block,
     
     seg_start_idx <- j
     
-    # extend while continuation holds (including the anchor interval)
-    k <- seg_start_idx
-    while (k <= n && dd_block$cont_instructorQA[k]) k <- k + 1
+    # Anchor is a subset of continuation; extend from the following interval.
+    k <- seg_start_idx + 1L
+    while (
+      k <= n &&
+      dd_block$cont_instructorQA[k] &&
+      dd_block$time[k] == dd_block$time[k - 1] + 1L
+    ) {
+      k <- k + 1L
+    }
     seg_end_idx <- k - 1
     
+    segment_length <- seg_end_idx - seg_start_idx + 1L
+    
     # enforce min length (in intervals)
-    if ((seg_end_idx - seg_start_idx + 1) >= min_len) {
+    if (segment_length >= min_len) {
       out[[length(out) + 1]] <- tibble::tibble(
         id          = dd_block$id[1],
         start_time  = dd_block$time[seg_start_idx],
         end_time    = dd_block$time[seg_end_idx],
-        n_intervals = dd_block$time[seg_end_idx] - dd_block$time[seg_start_idx] + 1,
-        minutes     = (dd_block$time[seg_end_idx] - dd_block$time[seg_start_idx] + 1) * 2,
+        n_intervals = segment_length,
+        minutes     = segment_length * 2L,
         type        = "InstructorQA"
       )
     }
@@ -1236,58 +1360,50 @@ scan_instructorQA_one_block <- function(dd_block,
     i <- seg_end_idx + 1
   }
   
-  if (length(out) == 0) {
-    tibble::tibble(
-      id=character(), start_time=integer(), end_time=integer(),
-      n_intervals=integer(), minutes=integer(), type=character()
-    )
-  } else dplyr::bind_rows(out)
+  if (length(out) == 0) empty_detector_segments() else dplyr::bind_rows(out)
 }
 
 detect_instructorQA_from_unlabeled <- function(master_data,
                                                unlabeled_segments,
                                                min_len = 1) {
   
-  if (nrow(unlabeled_segments) == 0) {
-    return(tibble::tibble(
-      id=character(), start_time=integer(), end_time=integer(),
-      n_intervals=integer(), minutes=integer(), type=character()
-    ))
-  }
+  if (nrow(unlabeled_segments) == 0) return(empty_detector_segments())
   
   purrr::pmap_dfr(
-    unlabeled_segments %>% select(id, start_time, end_time),
+    unlabeled_segments %>% dplyr::select(id, start_time, end_time),
     function(id, start_time, end_time) {
       
       block <- master_data %>%
-        filter(.data$id == !!id,
-               .data$time >= !!start_time,
-               .data$time <= !!end_time) %>%
-        arrange(time)
+        dplyr::filter(.data$id == !!id,
+                      .data$time >= !!start_time,
+                      .data$time <= !!end_time) %>%
+        dplyr::arrange(.data$time)
       
-      # Safety: skip empty blocks
-      if (nrow(block) == 0) return(NULL)
+      if (nrow(block) == 0) return(empty_detector_segments())
       
       dd <- build_instructorQA_flags(block)
       
       scan_instructorQA_one_block(dd, min_len = min_len)
     }
   ) %>%
-    arrange(id, start_time)
+    dplyr::arrange(.data$id, .data$start_time)
 }
 
 build_studentQA_flags <- function(df_block) {
   df_block %>%
-    arrange(time) %>%
-    mutate(
-      # anchor: MUST have student question + instructor answer or followup
+    dplyr::arrange(.data$time) %>%
+    dplyr::mutate(
+      # Anchor: student question and instructor answer in the same interval.
+      # FUp may continue, but cannot initiate, Student QA.
       anchor_studentQA =
-        (`Student.SQ` == 1) & ((`Instructor.AnQ` == 1) | (`Instructor.FUp` == 1)),
+        (`Student.SQ` == 1) & (`Instructor.AnQ` == 1),
       
-      # continue: instructor answering/followup/writing + students asking, answering, or listening
+      # Continue through answering/follow-up/writing plus student engagement.
       cont_studentQA =
-        ( (`Instructor.AnQ` == 1) | (`Instructor.FUp` == 1) | (`Instructor.RtW` == 1) ) &
-        ( (`Student.SQ` == 1) |  (`Student.AnQ` == 1) | (`Student.L` == 1) )
+        ( (`Instructor.AnQ` == 1) | (`Instructor.FUp` == 1) |
+            (`Instructor.RtW` == 1) ) &
+        ( (`Student.SQ` == 1) | (`Student.AnQ` == 1) |
+            (`Student.L` == 1) )
     )
 }
 
@@ -1295,7 +1411,7 @@ scan_studentQA_one_block <- function(dd_block,
                                      min_len = 1) {
   stopifnot(all(c("id","time","anchor_studentQA","cont_studentQA") %in% names(dd_block)))
   
-  dd_block <- dd_block %>% arrange(time)
+  dd_block <- dd_block %>% dplyr::arrange(.data$time)
   n <- nrow(dd_block)
   i <- 1
   out <- list()
@@ -1308,19 +1424,27 @@ scan_studentQA_one_block <- function(dd_block,
     
     seg_start_idx <- j
     
-    # extend while continuation holds
-    k <- seg_start_idx
-    while (k <= n && dd_block$cont_studentQA[k]) k <- k + 1
+    # Anchor is a subset of continuation; extend from the following interval.
+    k <- seg_start_idx + 1L
+    while (
+      k <= n &&
+      dd_block$cont_studentQA[k] &&
+      dd_block$time[k] == dd_block$time[k - 1] + 1L
+    ) {
+      k <- k + 1L
+    }
     seg_end_idx <- k - 1
     
+    segment_length <- seg_end_idx - seg_start_idx + 1L
+    
     # enforce min length (in intervals)
-    if ((seg_end_idx - seg_start_idx + 1) >= min_len) {
+    if (segment_length >= min_len) {
       out[[length(out) + 1]] <- tibble::tibble(
         id          = dd_block$id[1],
         start_time  = dd_block$time[seg_start_idx],
         end_time    = dd_block$time[seg_end_idx],
-        n_intervals = dd_block$time[seg_end_idx] - dd_block$time[seg_start_idx] + 1,
-        minutes     = (dd_block$time[seg_end_idx] - dd_block$time[seg_start_idx] + 1) * 2,
+        n_intervals = segment_length,
+        minutes     = segment_length * 2L,
         type        = "StudentQA"
       )
     }
@@ -1329,24 +1453,14 @@ scan_studentQA_one_block <- function(dd_block,
     i <- seg_end_idx + 1
   }
   
-  if (length(out) == 0) {
-    tibble::tibble(
-      id=character(), start_time=integer(), end_time=integer(),
-      n_intervals=integer(), minutes=integer(), type=character()
-    )
-  } else dplyr::bind_rows(out)
+  if (length(out) == 0) empty_detector_segments() else dplyr::bind_rows(out)
 }
 
 detect_studentQA_from_unlabeled <- function(master_data,
                                             unlabeled_segments,
                                             min_len = 1) {
   
-  if (nrow(unlabeled_segments) == 0) {
-    return(tibble::tibble(
-      id=character(), start_time=integer(), end_time=integer(),
-      n_intervals=integer(), minutes=integer(), type=character()
-    ))
-  }
+  if (nrow(unlabeled_segments) == 0) return(empty_detector_segments())
   
   purrr::pmap_dfr(
     unlabeled_segments %>% dplyr::select(id, start_time, end_time),
@@ -1358,7 +1472,7 @@ detect_studentQA_from_unlabeled <- function(master_data,
                       .data$time <= !!end_time) %>%
         dplyr::arrange(time)
       
-      if (nrow(block) == 0) return(NULL)
+      if (nrow(block) == 0) return(empty_detector_segments())
       
       dd <- build_studentQA_flags(block)
       
@@ -1369,67 +1483,56 @@ detect_studentQA_from_unlabeled <- function(master_data,
 }
 
 build_transition_flags <- function(df_block) {
-  
-  # exclusion sets
-  I_excl <- c("Instructor.Lec","Instructor.FUp","Instructor.PQ","Instructor.CQ",
-              "Instructor.AnQ","Instructor.MG","Instructor.1o1")
-  
-  S_excl <- c("Student.Ind","Student.CG","Student.WG","Student.OG",
-              "Student.AnQ","Student.SQ","Student.WC","Student.Prd",
-              "Student.SP","Student.TQ")
-  
   df_block %>%
-    arrange(time) %>%
-    mutate(
-      # base requirement: in-between behavior only
-      base_transition =
+    dplyr::arrange(.data$time) %>%
+    dplyr::mutate(
+      # PAM-derived residual pattern. No explicit instructional-code
+      # exclusions are needed because Transition has the lowest priority.
+      phase_transition =
         ( (`Instructor.W` == 1) | (`Instructor.Other` == 1) ) &
-        ( (`Student.W` == 1)    | (`Student.Other` == 1) ),
-      
-      # exclusion: no instructional codes present in the same interval
-      instr_excluded_I = rowSums(dplyr::across(dplyr::all_of(I_excl))) > 0,
-      instr_excluded_S = rowSums(dplyr::across(dplyr::all_of(S_excl))) > 0,
-      
-      # eligible if base holds and no excluded codes present
-      eligible_transition = base_transition & (!instr_excluded_I) & (!instr_excluded_S),
-      
-      # anchor/continue are identical for this detector
-      anchor_transition = eligible_transition,
-      cont_transition   = eligible_transition
+        ( (`Student.W` == 1) | (`Student.Other` == 1) )
     )
 }
 
 scan_transition_one_block <- function(dd_block,
                                       min_len = 1) {
-  stopifnot(all(c("id","time","anchor_transition","cont_transition") %in% names(dd_block)))
+  stopifnot(all(c("id", "time", "phase_transition") %in% names(dd_block)))
   
-  dd_block <- dd_block %>% arrange(time)
+  dd_block <- dd_block %>% dplyr::arrange(.data$time)
   n <- nrow(dd_block)
   i <- 1
   out <- list()
   
   while (i <= n) {
     
-    # find next anchor
+    # Find the next qualifying Transition interval.
     j <- i
-    while (j <= n && !dd_block$anchor_transition[j]) j <- j + 1
+    while (j <= n && !dd_block$phase_transition[j]) j <- j + 1
     if (j > n) break
     
     seg_start_idx <- j
     
-    # extend while continuation holds
-    k <- seg_start_idx
-    while (k <= n && dd_block$cont_transition[k]) k <- k + 1
+    # Extend a truly contiguous Transition run.
+    k <- seg_start_idx + 1L
+    while (
+      k <= n &&
+      dd_block$phase_transition[k] &&
+      dd_block$time[k] == dd_block$time[k - 1] + 1L
+    ) {
+      k <- k + 1L
+    }
     seg_end_idx <- k - 1
     
+    segment_length <- seg_end_idx - seg_start_idx + 1L
+    
     # enforce min length
-    if ((seg_end_idx - seg_start_idx + 1) >= min_len) {
+    if (segment_length >= min_len) {
       out[[length(out) + 1]] <- tibble::tibble(
         id          = dd_block$id[1],
         start_time  = dd_block$time[seg_start_idx],
         end_time    = dd_block$time[seg_end_idx],
-        n_intervals = dd_block$time[seg_end_idx] - dd_block$time[seg_start_idx] + 1,
-        minutes     = (dd_block$time[seg_end_idx] - dd_block$time[seg_start_idx] + 1) * 2,
+        n_intervals = segment_length,
+        minutes     = segment_length * 2L,
         type        = "Transition"
       )
     }
@@ -1437,24 +1540,14 @@ scan_transition_one_block <- function(dd_block,
     i <- seg_end_idx + 1
   }
   
-  if (length(out) == 0) {
-    tibble::tibble(
-      id=character(), start_time=integer(), end_time=integer(),
-      n_intervals=integer(), minutes=integer(), type=character()
-    )
-  } else dplyr::bind_rows(out)
+  if (length(out) == 0) empty_detector_segments() else dplyr::bind_rows(out)
 }
 
 detect_transition_from_unlabeled <- function(master_data,
                                              unlabeled_segments,
                                              min_len = 1) {
   
-  if (nrow(unlabeled_segments) == 0) {
-    return(tibble::tibble(
-      id=character(), start_time=integer(), end_time=integer(),
-      n_intervals=integer(), minutes=integer(), type=character()
-    ))
-  }
+  if (nrow(unlabeled_segments) == 0) return(empty_detector_segments())
   
   purrr::pmap_dfr(
     unlabeled_segments %>% dplyr::select(id, start_time, end_time),
@@ -1466,7 +1559,7 @@ detect_transition_from_unlabeled <- function(master_data,
                       .data$time <= !!end_time) %>%
         dplyr::arrange(time)
       
-      if (nrow(block) == 0) return(NULL)
+      if (nrow(block) == 0) return(empty_detector_segments())
       
       dd <- build_transition_flags(block)
       
@@ -1484,12 +1577,12 @@ detect_tertiary_candidates <- function(dat, unlabeled_segments) {
   }
   
   candidates <- dplyr::bind_rows(
-    detect_instructorQA_from_unlabeled(
+    detect_studentQA_from_unlabeled(
       master_data = dat,
       unlabeled_segments = unlabeled_segments,
       min_len = 1
     ),
-    detect_studentQA_from_unlabeled(
+    detect_instructorQA_from_unlabeled(
       master_data = dat,
       unlabeled_segments = unlabeled_segments,
       min_len = 1
@@ -1624,6 +1717,8 @@ collapse_alternative_labels <- function(
     ))
   }
   
+  # 1) Collapse consecutive intervals of the same alternative label
+  #    into separate alternative runs.
   alternative_runs <- interval_alternatives %>%
     dplyr::inner_join(
       intervals_with_segment_ids %>%
@@ -1672,21 +1767,58 @@ collapse_alternative_labels <- function(
       Start = min(.data$time),
       End = max(.data$time),
       .groups = "drop"
+    )
+  
+  # REVISED: Assign one rank per distinct alternative label within each
+  # final segment. Separate runs of the same label therefore share one lane.
+  # Ranking restarts within every final Segment_ID.
+  alternative_label_ranks <- alternative_runs %>%
+    dplyr::distinct(
+      .data$id,
+      .data$Segment_ID,
+      .data$Final_Label,
+      .data$stage,
+      .data$alternative_label,
+      .data$alternative_priority
     ) %>%
     dplyr::arrange(
       .data$id,
       .data$Segment_ID,
       .data$alternative_priority,
-      .data$Start,
-      .data$End,
       .data$alternative_label
     ) %>%
     dplyr::group_by(.data$id, .data$Segment_ID) %>%
     dplyr::mutate(
-      Alternative_Rank = dplyr::row_number(),
+      Alternative_Rank = dplyr::row_number()
+    ) %>%
+    dplyr::ungroup()
+  
+  # REVISED: Join the label-level rank back to every alternative run.
+  # Multiple runs of one label retain separate Start/End values but use
+  # the same Alternative_Rank and the same plotting lane.
+  alternative_runs %>%
+    dplyr::left_join(
+      alternative_label_ranks,
+      by = c(
+        "id",
+        "Segment_ID",
+        "Final_Label",
+        "stage",
+        "alternative_label",
+        "alternative_priority"
+      )
+    ) %>%
+    dplyr::mutate(
       Type = paste("Alternative", .data$Alternative_Rank)
     ) %>%
-    dplyr::ungroup() %>%
+    dplyr::arrange(
+      .data$id,
+      .data$Segment_ID,
+      .data$Alternative_Rank,
+      .data$Start,
+      .data$End,
+      .data$alternative_label
+    ) %>%
     dplyr::transmute(
       Segment_ID = .data$Segment_ID,
       Start = .data$Start,
@@ -1697,8 +1829,6 @@ collapse_alternative_labels <- function(
       Type = .data$Type,
       Stage = .data$stage
     )
-  
-  alternative_runs
 }
 
 
@@ -1840,4 +1970,3 @@ print.copus_segmentation_result <- function(x, ...) {
   print(x$segments, ...)
   invisible(x)
 }
-

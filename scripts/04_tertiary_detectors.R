@@ -57,339 +57,537 @@ message(
 )
 
 # ==== TERTIARY DETECTORS ====
-# Instructor QA ----------------
-# 1) build flags on residual block
-build_instructorQA_flags <- function(df_block) {
-  df_block %>%
-    arrange(time) %>%
-    mutate(
-      # anchor: MUST have PQ; students L or AnQ
-      anchor_instructorQA =
-        ((`Instructor.PQ` == 1) | (`Instructor.FUp` == 1) ) & ( (`Student.AnQ` == 1) | (`Student.L` == 1) ),
-      
-      # continue: PQ/FUp/RtW/AnQ allowed; students L or AnQ or asking questions
-      cont_instructorQA =
-        ( (`Instructor.PQ` == 1) | (`Instructor.FUp` == 1) | (`Instructor.RtW` == 1) |  (`Instructor.AnQ` == 1)  ) &
-        ( (`Student.AnQ` == 1) | (`Student.SQ` == 1) |  (`Student.L` == 1) )
-    )
+# Helper for Tertiary Detectors --------------------------------
+# Used by Instructor QA, Student QA, and Transition detectors
+#
+# Brief description:
+# When no segment is detected, return a standardized empty result
+# with the same columns and data types as the regular detector output.
+
+empty_tertiary_segments <- function() {
+  tibble::tibble(
+    id          = character(),
+    start_time  = integer(),
+    end_time    = integer(),
+    n_intervals = integer(),
+    minutes     = integer(),
+    type        = character()
+  )
 }
 
-# 2) scanner for one unlabeled block
+# Instructor QA ----------------
+# Logic:
+#   Instructor QA begins with an instructor-posed question (PQ)
+#   accompanied by student answering or listening.
+#
+#  Anchor: Instructor.PQ AND (Student.AnQ OR Student.L)
+#  Continuation: Instructor.PQ/FUp/RtW/AnQ  AND  Student.AnQ/SQ/L
+#
+# Allows:
+#   A single 2-minute Instructor QA interval
+#   Multiple contiguous QA intervals
+
+# 1) Build Instructor QA flags on one residual block
+
+build_instructorQA_flags <- function(df_block) {
+  df_block %>%
+    dplyr::arrange(time) %>%
+    dplyr::mutate(
+      
+      # REVISED:
+      # Instructor QA must be initiated by Instructor.PQ; FUp can no longer serve as an anchor.
+      anchor_instructorQA =
+        (`Instructor.PQ` == 1) & ((`Student.AnQ` == 1) | (`Student.L` == 1)),
+      
+      cont_instructorQA = ((`Instructor.PQ` == 1)  | (`Instructor.FUp` == 1) |
+            (`Instructor.RtW` == 1) | (`Instructor.AnQ` == 1)) & 
+            ((`Student.AnQ` == 1) | (`Student.SQ` == 1)  | (`Student.L` == 1)))
+}
+
+
+# 2) Scan one residual unlabeled block
+
 scan_instructorQA_one_block <- function(dd_block,
                                         min_len = 1) {
+  
   stopifnot(all(c("id","time","anchor_instructorQA","cont_instructorQA") %in% names(dd_block)))
   
-  dd_block <- dd_block %>% arrange(time)
-  n <- nrow(dd_block)
-  i <- 1
+  dd_block <- dd_block %>%
+    dplyr::arrange(time)
+  
+  n   <- nrow(dd_block)
+  i   <- 1
   out <- list()
   
   while (i <= n) {
-    # find next anchor
+    
+    ## (A) Find the next valid Instructor QA anchor
     j <- i
-    while (j <= n && !dd_block$anchor_instructorQA[j]) j <- j + 1
+    
+    while (
+      j <= n &&
+      !dd_block$anchor_instructorQA[j]
+    ) {
+      j <- j + 1
+    }
+    
     if (j > n) break
     
     seg_start_idx <- j
     
-    # extend while continuation holds (including the anchor interval)
-    k <- seg_start_idx
-    while (k <= n && dd_block$cont_instructorQA[k]) k <- k + 1
+    
+    ## (B) Extend through contiguous continuation intervals
+    
+    # The anchor condition is a subset of the continuation condition,
+    # so scanning can begin with the interval after the anchor.
+    k <- seg_start_idx + 1
+    
+    while (
+      k <= n &&
+      dd_block$cont_instructorQA[k] &&
+      
+      # REVISED:
+      # Require actual chronological adjacency.
+      dd_block$time[k] == dd_block$time[k - 1] + 1
+    ) {
+      k <- k + 1
+    }
+    
     seg_end_idx <- k - 1
     
-    # enforce min length (in intervals)
-    if ((seg_end_idx - seg_start_idx + 1) >= min_len) {
+    
+    ## (C) Calculate segment length using the actual number of rows
+    
+    # REVISED:
+    # Row count is safer than end_time - start_time + 1,
+    # especially when the data contain missing time bins.
+    segment_length <- seg_end_idx - seg_start_idx + 1
+    
+
+    ## (D) Record segment when minimum length is satisfied
+    
+    if (segment_length >= min_len) {
+      
       out[[length(out) + 1]] <- tibble::tibble(
         id          = dd_block$id[1],
         start_time  = dd_block$time[seg_start_idx],
         end_time    = dd_block$time[seg_end_idx],
-        n_intervals = dd_block$time[seg_end_idx] - dd_block$time[seg_start_idx] + 1,
-        minutes     = (dd_block$time[seg_end_idx] - dd_block$time[seg_start_idx] + 1) * 2,
+        n_intervals = segment_length,
+        minutes     = segment_length * 2,
         type        = "InstructorQA"
       )
     }
     
-    # move cursor to first interval after this segment
+    
+    ## (E) Move to the first interval after this segment
+    
     i <- seg_end_idx + 1
   }
   
+  
+  # Return standardized empty output when no segment is detected
   if (length(out) == 0) {
-    tibble::tibble(
-      id=character(), start_time=integer(), end_time=integer(),
-      n_intervals=integer(), minutes=integer(), type=character()
-    )
-  } else dplyr::bind_rows(out)
+    empty_tertiary_segments()
+  } else {
+    dplyr::bind_rows(out)
+  }
 }
 
-# 3) apply across ALL residual unlabeled blocks
+
+# 3) Apply detector across all residual unlabeled blocks 
+
 detect_instructorQA_from_unlabeled <- function(master_data,
                                                unlabeled_segments,
                                                min_len = 1) {
   
+  # No residual unlabeled blocks are available
   if (nrow(unlabeled_segments) == 0) {
-    return(tibble::tibble(
-      id=character(), start_time=integer(), end_time=integer(),
-      n_intervals=integer(), minutes=integer(), type=character()
-    ))
+    return(empty_tertiary_segments())
   }
   
   purrr::pmap_dfr(
-    unlabeled_segments %>% select(id, start_time, end_time),
+    unlabeled_segments %>%
+      dplyr::select(id, start_time, end_time),
+    
     function(id, start_time, end_time) {
       
+      # Extract the corresponding residual block
       block <- master_data %>%
-        filter(.data$id == !!id,
-               .data$time >= !!start_time,
-               .data$time <= !!end_time) %>%
-        arrange(time)
+        dplyr::filter(
+          .data$id == !!id,
+          .data$time >= !!start_time,
+          .data$time <= !!end_time
+        ) %>%
+        dplyr::arrange(time)
       
-      # Safety: skip empty blocks
-      if (nrow(block) == 0) return(NULL)
+      # Safety check for an empty residual block
+      if (nrow(block) == 0) {
+        return(empty_tertiary_segments())
+      }
       
+      # Build flags and scan the residual block
       dd <- build_instructorQA_flags(block)
       
-      scan_instructorQA_one_block(dd, min_len = min_len)
+      scan_instructorQA_one_block(
+        dd_block = dd,
+        min_len  = min_len
+      )
     }
   ) %>%
-    arrange(id, start_time)
+    dplyr::arrange(id, start_time)
 }
 
-# 4) Run it (Instructor QA only)
+
+# 4) Run Instructor QA detector 
+
 instructorQA_segments <- detect_instructorQA_from_unlabeled(
-  master_data = master_data,
-  unlabeled_segments = unlabeled_segments,
-  min_len = 1
+  master_data         = master_data,
+  unlabeled_segments  = unlabeled_segments,
+  min_len             = 1
 )
 
 instructorQA_segments
 
-
 # Student QA ----------------------
-# 1) build flags on a residual block
+# Logic:
+#   Student QA begins with Student.SQ AND Instructor.AnQ. 
+#
+#   Anchor: Student.SQ AND Instructor.AnQ
+#   Continuation: Instructor.AnQ/FUp/RtW AND Student.SQ/AnQ/L
+#
+# Allows:
+#   A single 2-min Student QA interval
+#   Multiple contiguous QA intervals
+
+# 1) Build Student QA flags on one residual block 
+
 build_studentQA_flags <- function(df_block) {
+  
   df_block %>%
-    arrange(time) %>%
-    mutate(
-      # anchor: MUST have student question + instructor answer or followup
-      anchor_studentQA =
-        (`Student.SQ` == 1) & ((`Instructor.AnQ` == 1) | (`Instructor.FUp` == 1)),
+    dplyr::arrange(time) %>%
+    dplyr::mutate(
       
-      # continue: instructor answering/followup/writing + students asking, answering, or listening
+      # REVISED:
+      # Student QA must begin with a student question; FUp can no longer serve as part of the anchor.
+      anchor_studentQA =
+        (`Student.SQ` == 1) &
+        (`Instructor.AnQ` == 1),
+      
       cont_studentQA =
-        ( (`Instructor.AnQ` == 1) | (`Instructor.FUp` == 1) | (`Instructor.RtW` == 1) ) &
-        ( (`Student.SQ` == 1) |  (`Student.AnQ` == 1) | (`Student.L` == 1) )
-    )
+        ((`Instructor.AnQ` == 1) | (`Instructor.FUp` == 1) | (`Instructor.RtW` == 1)) &
+        ((`Student.SQ` == 1)  | (`Student.AnQ` == 1) | (`Student.L` == 1)))
 }
 
-# 2) scanner for one unlabeled block
+
+# 2) Scan one residual unlabeled block 
+
 scan_studentQA_one_block <- function(dd_block,
                                      min_len = 1) {
-  stopifnot(all(c("id","time","anchor_studentQA","cont_studentQA") %in% names(dd_block)))
   
-  dd_block <- dd_block %>% arrange(time)
-  n <- nrow(dd_block)
-  i <- 1
+  stopifnot(
+    all(c("id","time","anchor_studentQA","cont_studentQA") %in% names(dd_block)))
+  
+  dd_block <- dd_block %>%
+    dplyr::arrange(time)
+  
+  n   <- nrow(dd_block)
+  i   <- 1
   out <- list()
   
   while (i <= n) {
-    # find next anchor
+    
+    ## (A) Find the next valid Student QA anchor
+    
     j <- i
-    while (j <= n && !dd_block$anchor_studentQA[j]) j <- j + 1
+    
+    while (
+      j <= n &&
+      !dd_block$anchor_studentQA[j]
+    ) {
+      j <- j + 1
+    }
+    
     if (j > n) break
     
     seg_start_idx <- j
     
-    # extend while continuation holds
-    k <- seg_start_idx
-    while (k <= n && dd_block$cont_studentQA[k]) k <- k + 1
+    
+    ## (B) Extend through contiguous continuation intervals
+    
+    # REVISED:
+    # The anchor condition is a subset of the continuation condition,
+    # so begin checking from the interval after the anchor.
+    k <- seg_start_idx + 1
+    
+    while (
+      k <= n &&
+      dd_block$cont_studentQA[k] &&
+      
+      # REVISED:
+      # Require actual chronological adjacency.
+      dd_block$time[k] == dd_block$time[k - 1] + 1
+    ) {
+      k <- k + 1
+    }
+    
     seg_end_idx <- k - 1
     
-    # enforce min length (in intervals)
-    if ((seg_end_idx - seg_start_idx + 1) >= min_len) {
+    
+    ## (C) Calculate segment length using actual row count
+    
+    # REVISED:
+    # This avoids overestimating duration when time bins are missing.
+    segment_length <- seg_end_idx - seg_start_idx + 1
+    
+    
+    ## (D) Record the segment
+    
+    if (segment_length >= min_len) {
+      
       out[[length(out) + 1]] <- tibble::tibble(
         id          = dd_block$id[1],
         start_time  = dd_block$time[seg_start_idx],
         end_time    = dd_block$time[seg_end_idx],
-        n_intervals = dd_block$time[seg_end_idx] - dd_block$time[seg_start_idx] + 1,
-        minutes     = (dd_block$time[seg_end_idx] - dd_block$time[seg_start_idx] + 1) * 2,
+        n_intervals = segment_length,
+        minutes     = segment_length * 2,
         type        = "StudentQA"
       )
     }
     
-    # advance cursor
+    
+    ## (E) Advance cursor
+    
     i <- seg_end_idx + 1
   }
   
+  
+  # REVISED:
+  # Use the shared empty-output helper.
   if (length(out) == 0) {
-    tibble::tibble(
-      id=character(), start_time=integer(), end_time=integer(),
-      n_intervals=integer(), minutes=integer(), type=character()
-    )
-  } else dplyr::bind_rows(out)
+    empty_tertiary_segments()
+  } else {
+    dplyr::bind_rows(out)
+  }
 }
 
 
-# 3) apply across ALL residual unlabeled blocks
+# 3) Apply detector across all residual unlabeled blocks
+
 detect_studentQA_from_unlabeled <- function(master_data,
                                             unlabeled_segments,
                                             min_len = 1) {
   
+  # REVISED:
+  # Use the shared empty-output helper when no residual blocks exist.
   if (nrow(unlabeled_segments) == 0) {
-    return(tibble::tibble(
-      id=character(), start_time=integer(), end_time=integer(),
-      n_intervals=integer(), minutes=integer(), type=character()
-    ))
+    return(empty_tertiary_segments())
   }
   
   purrr::pmap_dfr(
-    unlabeled_segments %>% dplyr::select(id, start_time, end_time),
+    unlabeled_segments %>%
+      dplyr::select(id, start_time, end_time),
+    
     function(id, start_time, end_time) {
       
+      # Extract the corresponding residual block
       block <- master_data %>%
-        dplyr::filter(.data$id == !!id,
-                      .data$time >= !!start_time,
-                      .data$time <= !!end_time) %>%
+        dplyr::filter(
+          .data$id == !!id,
+          .data$time >= !!start_time,
+          .data$time <= !!end_time
+        ) %>%
         dplyr::arrange(time)
       
-      if (nrow(block) == 0) return(NULL)
+      # Safety check for an empty residual block
+      if (nrow(block) == 0) {
+        return(empty_tertiary_segments())
+      }
       
+      # Build flags and scan the residual block
       dd <- build_studentQA_flags(block)
       
-      scan_studentQA_one_block(dd, min_len = min_len)
+      scan_studentQA_one_block(
+        dd_block = dd,
+        min_len  = min_len
+      )
     }
   ) %>%
     dplyr::arrange(id, start_time)
 }
 
-# 4) run it
+
+# 4) Run Student QA detector
+
 studentQA_segments <- detect_studentQA_from_unlabeled(
-  master_data = master_data,
+  master_data        = master_data,
   unlabeled_segments = unlabeled_segments,
-  min_len = 1
+  min_len            = 1
 )
 
 studentQA_segments
 
-
 # Transition ----------
-# 1) build flags on a residual block
+# Logic: (Instructor.W OR Instructor.Other) AND (Student.W OR Student.Other)
+#
+# Allows:
+#   A single 2-min Transition interval
+#   Multiple contiguous Transition intervals
+
+# 1) Build Transition flag on one residual block 
+
 build_transition_flags <- function(df_block) {
   
-  # exclusion sets
-  I_excl <- c("Instructor.Lec","Instructor.FUp","Instructor.PQ","Instructor.CQ",
-              "Instructor.AnQ","Instructor.MG","Instructor.1o1")
-  
-  S_excl <- c("Student.Ind","Student.CG","Student.WG","Student.OG",
-              "Student.AnQ","Student.SQ","Student.WC","Student.Prd",
-              "Student.SP","Student.TQ")
-  
   df_block %>%
-    arrange(time) %>%
-    mutate(
-      # base requirement: in-between behavior only
-      base_transition =
-        ( (`Instructor.W` == 1) | (`Instructor.Other` == 1) ) &
-        ( (`Student.W` == 1)    | (`Student.Other` == 1) ),
+    dplyr::arrange(time) %>%
+    dplyr::mutate(
       
-      # exclusion: no instructional codes present in the same interval
-      instr_excluded_I = rowSums(dplyr::across(dplyr::all_of(I_excl))) > 0,
-      instr_excluded_S = rowSums(dplyr::across(dplyr::all_of(S_excl))) > 0,
-      
-      # eligible if base holds and no excluded codes present
-      eligible_transition = base_transition & (!instr_excluded_I) & (!instr_excluded_S),
-      
-      # anchor/continue are identical for this detector
-      anchor_transition = eligible_transition,
-      cont_transition   = eligible_transition
-    )
+      # REVISED:
+      # No additional instructional-code exclusions are applied.
+      phase_transition =
+        ((`Instructor.W` == 1) | (`Instructor.Other` == 1)) &
+        ((`Student.W` == 1) | (`Student.Other` == 1)))
 }
 
-# 2) scanner for one unlabeled block
+
+# 2) Scan one residual unlabeled block 
+
 scan_transition_one_block <- function(dd_block,
                                       min_len = 1) {
-  stopifnot(all(c("id","time","anchor_transition","cont_transition") %in% names(dd_block)))
   
-  dd_block <- dd_block %>% arrange(time)
-  n <- nrow(dd_block)
-  i <- 1
+  stopifnot(all(c("id","time","phase_transition") %in% names(dd_block)))
+  
+  dd_block <- dd_block %>%
+    dplyr::arrange(time)
+  
+  n   <- nrow(dd_block)
+  i   <- 1
   out <- list()
   
   while (i <= n) {
     
-    # find next anchor
+    ## (A) Find the next Transition interval
+    
     j <- i
-    while (j <= n && !dd_block$anchor_transition[j]) j <- j + 1
+    
+    while (
+      j <= n &&
+      !dd_block$phase_transition[j]
+    ) {
+      j <- j + 1
+    }
+    
     if (j > n) break
     
     seg_start_idx <- j
     
-    # extend while continuation holds
-    k <- seg_start_idx
-    while (k <= n && dd_block$cont_transition[k]) k <- k + 1
+    
+    ## (B) Extend the contiguous Transition run
+    
+    k <- seg_start_idx + 1
+    
+    while (
+      k <= n &&
+      dd_block$phase_transition[k] &&
+      
+      # REVISED:
+      # Require actual chronological adjacency.
+      dd_block$time[k] == dd_block$time[k - 1] + 1
+    ) {
+      k <- k + 1
+    }
+    
     seg_end_idx <- k - 1
     
-    # enforce min length
-    if ((seg_end_idx - seg_start_idx + 1) >= min_len) {
+    
+    ## (C) Calculate segment length using actual row count
+    
+    # REVISED:
+    # Row count avoids overestimating duration if time bins are missing.
+    segment_length <- seg_end_idx - seg_start_idx + 1
+    
+    
+    ## (D) Record the Transition segment
+    
+    if (segment_length >= min_len) {
+      
       out[[length(out) + 1]] <- tibble::tibble(
         id          = dd_block$id[1],
         start_time  = dd_block$time[seg_start_idx],
         end_time    = dd_block$time[seg_end_idx],
-        n_intervals = dd_block$time[seg_end_idx] - dd_block$time[seg_start_idx] + 1,
-        minutes     = (dd_block$time[seg_end_idx] - dd_block$time[seg_start_idx] + 1) * 2,
+        n_intervals = segment_length,
+        minutes     = segment_length * 2,
         type        = "Transition"
       )
     }
     
+    
+    ## (E) Advance cursor
+    
     i <- seg_end_idx + 1
   }
   
+  
+  # REVISED:
+  # Use the shared empty-output helper.
   if (length(out) == 0) {
-    tibble::tibble(
-      id=character(), start_time=integer(), end_time=integer(),
-      n_intervals=integer(), minutes=integer(), type=character()
-    )
-  } else dplyr::bind_rows(out)
+    empty_tertiary_segments()
+  } else {
+    dplyr::bind_rows(out)
+  }
 }
 
 
-# 3) apply across ALL residual unlabeled blocks
+# 3) Apply detector across all residual unlabeled blocks
+
 detect_transition_from_unlabeled <- function(master_data,
                                              unlabeled_segments,
                                              min_len = 1) {
   
+  # REVISED:
+  # Use the shared helper when no residual blocks exist.
   if (nrow(unlabeled_segments) == 0) {
-    return(tibble::tibble(
-      id=character(), start_time=integer(), end_time=integer(),
-      n_intervals=integer(), minutes=integer(), type=character()
-    ))
+    return(empty_tertiary_segments())
   }
   
   purrr::pmap_dfr(
-    unlabeled_segments %>% dplyr::select(id, start_time, end_time),
+    unlabeled_segments %>%
+      dplyr::select(id, start_time, end_time),
+    
     function(id, start_time, end_time) {
       
+      # Extract the corresponding residual block
       block <- master_data %>%
-        dplyr::filter(.data$id == !!id,
-                      .data$time >= !!start_time,
-                      .data$time <= !!end_time) %>%
+        dplyr::filter(
+          .data$id == !!id,
+          .data$time >= !!start_time,
+          .data$time <= !!end_time
+        ) %>%
         dplyr::arrange(time)
       
-      if (nrow(block) == 0) return(NULL)
+      # Safety check for an empty residual block
+      if (nrow(block) == 0) {
+        return(empty_tertiary_segments())
+      }
       
+      # Build flag and scan the residual block
       dd <- build_transition_flags(block)
       
-      scan_transition_one_block(dd, min_len = min_len)
+      scan_transition_one_block(
+        dd_block = dd,
+        min_len  = min_len
+      )
     }
   ) %>%
     dplyr::arrange(id, start_time)
 }
 
 
-# 4) run it
+# 4) Run Transition detector
+
 transition_segments <- detect_transition_from_unlabeled(
-  master_data = master_data,
+  master_data        = master_data,
   unlabeled_segments = unlabeled_segments,
-  min_len = 1
+  min_len            = 1
 )
 
 transition_segments
